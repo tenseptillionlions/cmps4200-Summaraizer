@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -9,6 +10,8 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+import customtkinter as ctk
+from PIL import Image, ImageDraw
 from tkinter import (
     BOTH,
     Canvas,
@@ -39,18 +42,20 @@ AUDIO_TYPES = {".mp3": "Audio", ".wav": "Audio"}
 SUPPORTED_TYPES = {**DOCUMENT_TYPES, **AUDIO_TYPES}
 
 COLORS = {
-    "background": "#F5F6F8",
+    "background": "#F9FAFB",
     "surface": "#FFFFFF",
     "sidebar": "#17212B",
     "sidebar_muted": "#AAB5C0",
-    "text": "#18212B",
-    "muted": "#65717E",
-    "border": "#E1E5EA",
-    "accent": "#536DFE",
-    "accent_hover": "#4058E8",
-    "accent_light": "#EEF0FF",
-    "success": "#18794E",
-    "success_light": "#E8F5EE",
+    "text": "#0F172A",
+    "body": "#334155",
+    "muted": "#64748B",
+    "border": "#E2E8F0",
+    "accent": "#3B82F6",
+    "accent_hover": "#2563EB",
+    "accent_light": "#EEF2FF",
+    "success": "#10B981",
+    "success_hover": "#059669",
+    "success_light": "#ECFDF5",
     "warning": "#946200",
     "warning_light": "#FFF4D6",
     "danger": "#B42318",
@@ -254,8 +259,16 @@ class ScrollableFrame(Frame):
             self.canvas.yview_scroll(int(-delta / 120), "units")
 
 
+class TranscriptTextbox(ctk.CTkTextbox):
+    def cget(self, attribute_name: str) -> object:
+        if attribute_name == "state":
+            return self._textbox.cget("state")
+        return super().cget(attribute_name)
+
+
 class SummaraizerApp:
     def __init__(self, root: Tk, store: CompilationStore | None = None) -> None:
+        ctk.set_appearance_mode("light")
         self.root = root
         self.store = store or CompilationStore()
         self.compilations = self.store.load()
@@ -266,9 +279,17 @@ class SummaraizerApp:
         self.summary_editor: Text | None = None
         self.summary_editor_path: str | None = None
         self.summary_drafts: dict[str, str] = {}
-        self.transcription_editor: Text | None = None
+        self.summary_progress: ctk.CTkProgressBar | None = None
+        self.summary_stream_after: str | None = None
+        self.summary_stream_generation = 0
+        self.summary_streaming_path: str | None = None
+        self.transcription_editor: Text | TranscriptTextbox | None = None
         self.transcription_editor_path: str | None = None
         self.audio_status_label: Label | None = None
+        self.audio_slider: ctk.CTkSlider | None = None
+        self.audio_time_label: Label | None = None
+        self.audio_duration_seconds = 0.0
+        self.audio_position_after: str | None = None
         self.transcription_drafts: dict[str, str] = {}
         self._c_wnd_proc: object | None = None
         self._old_wnd_proc: object | None = None
@@ -277,6 +298,7 @@ class SummaraizerApp:
         self.retryable_chat_responses: set[int] = set()
         self.page_container: Frame
         self.page_title: Label
+        self.empty_state_icon: ctk.CTkImage | None = None
 
         self._configure_styles()
         self.root.title(APP_NAME)
@@ -325,7 +347,7 @@ class SummaraizerApp:
             padx=28,
             pady=19,
         )
-        self.page_title.pack(side=LEFT)
+        self.page_title.grid(row=0, column=0, sticky="w")
         self.active_name = Label(
             topbar,
             text="No compilation selected",
@@ -334,7 +356,8 @@ class SummaraizerApp:
             background=COLORS["surface"],
             padx=24,
         )
-        self.active_name.pack(side=RIGHT)
+        self.active_name.grid(row=0, column=1, sticky="e")
+        topbar.columnconfigure(0, weight=1)
         self.page_container = Frame(main, background=COLORS["background"])
         self.page_container.pack(fill=BOTH, expand=True)
 
@@ -472,6 +495,17 @@ class SummaraizerApp:
 
     def show_page(self, page: str) -> None:
         previous_page = self.active_page
+        self.summary_stream_generation += 1
+        if self.summary_stream_after is not None:
+            self.root.after_cancel(self.summary_stream_after)
+            self.summary_stream_after = None
+        if self.summary_progress is not None:
+            self.summary_progress.stop()
+            self.summary_progress = None
+        if self.audio_position_after is not None:
+            self.root.after_cancel(self.audio_position_after)
+            self.audio_position_after = None
+        self.summary_streaming_path = None
         if page == "summary":
             compilation = self.active_compilation
             if compilation is not None:
@@ -544,6 +578,7 @@ class SummaraizerApp:
         command: Callable[[], None],
         *,
         primary: bool = False,
+        success: bool = False,
         compact: bool = False,
         large: bool = False,
         padx: int | None = None,
@@ -560,31 +595,38 @@ class SummaraizerApp:
             parent,
             text=text,
             command=command,
-            font=("Segoe UI", font_size, "bold" if (primary or large) else "normal"),
+            font=(
+                "Segoe UI",
+                font_size,
+                "bold" if (primary or success or large) else "normal",
+            ),
             relief="flat",
             borderwidth=0,
             padx=padx,
             pady=pady,
             cursor="hand2",
-            background=COLORS["accent"] if primary else COLORS["surface"],
-            foreground="#FFFFFF" if primary else COLORS["text"],
+            background=(
+                COLORS["success"] if success else
+                COLORS["accent"] if primary else COLORS["surface"]
+            ),
+            foreground="#FFFFFF" if (primary or success) else COLORS["text"],
             activebackground=(
+                COLORS["success_hover"] if success else
                 COLORS["accent_hover"] if primary else COLORS["accent_light"]
             ),
-            activeforeground="#FFFFFF" if primary else COLORS["text"],
+            activeforeground="#FFFFFF" if (primary or success) else COLORS["text"],
             highlightbackground=COLORS["border"],
-            highlightthickness=1 if not primary else 0,
+            highlightthickness=0 if primary else 1,
         )
         return button
 
     def _card(self, parent: Frame, **kwargs: object) -> Frame:
-        return Frame(
+        return ctk.CTkFrame(
             parent,
-            background=COLORS["surface"],
-            highlightbackground=COLORS["border"],
-            highlightthickness=1,
-            padx=20,
-            pady=18,
+            fg_color=COLORS["surface"],
+            border_color=COLORS["border"],
+            border_width=1,
+            corner_radius=10,
             **kwargs,
         )
 
@@ -622,29 +664,59 @@ class SummaraizerApp:
         if not self.compilations:
             empty = self._card(self.page_container)
             empty.pack(fill=X, padx=34, pady=4)
+            empty_content = Frame(
+                empty, background=COLORS["surface"], padx=28, pady=24
+            )
+            empty_content.pack(fill=X)
+            empty_content.pack_propagate(False)
+            empty_content.configure(height=238)
+            empty_content.grid_columnconfigure(0, weight=1)
+            icon_art = Image.new("RGBA", (72, 72), (0, 0, 0, 0))
+            icon_draw = ImageDraw.Draw(icon_art)
+            icon_draw.rounded_rectangle(
+                (4, 4, 68, 68), radius=20, fill="#EEF2FF"
+            )
+            icon_draw.rounded_rectangle(
+                (17, 24, 55, 52), radius=6, fill="#3B82F6"
+            )
+            icon_draw.rounded_rectangle((19, 17, 37, 27), radius=4, fill="#3B82F6")
+            icon_draw.line((25, 34, 47, 34), fill="#FFFFFF", width=3)
+            icon_draw.line((25, 42, 42, 42), fill="#BFDBFE", width=3)
+            icon_draw.ellipse((45, 43, 62, 60), fill="#FFFFFF")
+            icon_draw.line((53, 47, 53, 56), fill="#3B82F6", width=2)
+            icon_draw.line((49, 51, 57, 51), fill="#3B82F6", width=2)
+            self.empty_state_icon = ctk.CTkImage(
+                light_image=icon_art, dark_image=icon_art, size=(72, 72)
+            )
+            ctk.CTkLabel(
+                empty_content, image=self.empty_state_icon, text=""
+            ).pack(pady=(0, 10))
             Label(
-                empty,
+                empty_content,
                 text="Welcome to Summaraizer",
-                font=("Segoe UI", 14, "bold"),
+                font=("Segoe UI", 18, "bold"),
                 foreground=COLORS["text"],
                 background=COLORS["surface"],
-            ).pack(anchor="w")
+            ).pack(anchor="center")
             Label(
-                empty,
+                empty_content,
                 text=(
                     "This application uses AI to compile and summarize information "
                     "from text and audio files. To begin, create a new compilation."
                 ),
                 font=("Segoe UI", 10),
-                foreground=COLORS["muted"],
+                foreground=COLORS["body"],
                 background=COLORS["surface"],
-            ).pack(anchor="w", pady=(6, 14))
+                justify="center",
+                wraplength=540,
+            ).pack(anchor="center", pady=(6, 14))
             self._button(
-                empty,
-                "Create your first compilation",
+                empty_content,
+                "+  Create your first compilation",
                 self._open_create_dialog,
                 primary=True,
-            ).pack(anchor="w")
+                large=True,
+            ).pack(anchor="center")
             return
 
         collection = ScrollableFrame(self.page_container)
@@ -1184,29 +1256,28 @@ class SummaraizerApp:
             background=COLORS["surface"],
         ).pack(side=RIGHT)
 
-        drop_zone = Frame(
+        drop_zone = ctk.CTkFrame(
             panel,
-            background="#F0F4FF",
-            highlightbackground=COLORS["accent"],
-            highlightthickness=1,
-            padx=14,
-            pady=12,
-            cursor="hand2",
+            fg_color="#EEF2FF",
+            border_color="#C7D2FE",
+            border_width=1,
+            corner_radius=10,
         )
-        drop_zone.pack(fill=X, pady=(0, 12))
+        drop_zone.pack(fill=X, pady=(0, 12), padx=2)
         Label(
             drop_zone,
-            text="📁 Drag & drop files here to add them to this compilation",
+            text="⇧  Drag & drop files here to add them to this compilation",
             font=("Segoe UI", 10, "bold"),
             foreground=COLORS["accent"],
-            background="#F0F4FF",
+            background="#EEF2FF",
+            pady=12,
         ).pack(anchor="center")
         Label(
             drop_zone,
             text="Supported types: .txt, .pdf, .mp3, .wav  (or click to browse)",
             font=("Segoe UI", 8),
             foreground=COLORS["muted"],
-            background="#F0F4FF",
+            background="#EEF2FF",
         ).pack(anchor="center", pady=(2, 0))
         drop_zone.bind("<Button-1>", lambda _e: self._choose_files())
         for child in drop_zone.winfo_children():
@@ -1225,13 +1296,12 @@ class SummaraizerApp:
             file_list = ScrollableFrame(panel)
             file_list.pack(fill=BOTH, expand=True)
             for path in compilation.files:
-                row = Frame(
+                row = ctk.CTkFrame(
                     file_list.content,
-                    background=COLORS["surface"],
-                    highlightbackground=COLORS["border"],
-                    highlightthickness=1,
-                    padx=12,
-                    pady=10,
+                    fg_color=COLORS["surface"],
+                    border_color=COLORS["border"],
+                    border_width=1,
+                    corner_radius=8,
                 )
                 row.pack(fill=X, pady=(0, 8))
                 file_type = classify_file(path) or "Unsupported"
@@ -1390,31 +1460,13 @@ class SummaraizerApp:
             background=COLORS["surface"],
         )
         self.audio_status_label.pack(anchor="w", pady=(4, 0))
-        player_controls = Frame(audio_header, background=COLORS["surface"])
-        player_controls.pack(side=LEFT, padx=(10, 8))
-        self._button(
-            player_controls,
-            "▶  Play",
-            lambda selected=path: self._play_audio(selected),
-            primary=True,
-            compact=True,
-        ).pack(side=LEFT)
-        self._button(
-            player_controls,
-            "Ⅱ  Pause",
-            self._pause_audio,
-            compact=True,
-        ).pack(side=LEFT, padx=8)
-        self._button(
-            player_controls, "■  Stop", self._stop_audio, compact=True
-        ).pack(side=LEFT)
         actions = Frame(audio_header, background=COLORS["surface"])
         actions.pack(side=RIGHT, padx=(8, 0))
         self._button(
             actions,
             "Save Edits",
             lambda selected=path: self._save_transcription(selected),
-            primary=True,
+            success=True,
             compact=True,
         ).pack(side=RIGHT, padx=(6, 0))
         self._button(
@@ -1429,6 +1481,59 @@ class SummaraizerApp:
             lambda selected=path: self._discard_transcription(selected),
             compact=True,
         ).pack(side=RIGHT)
+
+        player = ctk.CTkFrame(
+            audio_card,
+            fg_color="#F8FAFC",
+            corner_radius=10,
+        )
+        player.pack(fill=X, pady=(12, 0))
+        player_controls = Frame(player, background="#F8FAFC", padx=12, pady=8)
+        player_controls.pack(fill=X)
+        self._button(
+            player_controls,
+            "▶",
+            lambda selected=path: self._play_audio(selected),
+            primary=True,
+            compact=True,
+        ).pack(side=LEFT)
+        self._button(
+            player_controls,
+            "Ⅱ",
+            self._pause_audio,
+            compact=True,
+        ).pack(side=LEFT, padx=(8, 0))
+        self._button(
+            player_controls,
+            "■",
+            self._stop_audio,
+            compact=True,
+        ).pack(side=LEFT, padx=(8, 12))
+        self.audio_time_label = Label(
+            player_controls,
+            text="0:00 / 0:00",
+            font=("Segoe UI", 9),
+            foreground=COLORS["muted"],
+            background="#F8FAFC",
+        )
+        self.audio_time_label.pack(side=RIGHT)
+        self.audio_slider = ctk.CTkSlider(
+            player_controls,
+            from_=0,
+            to=1,
+            number_of_steps=100,
+            command=self._seek_audio,
+            height=16,
+            progress_color=COLORS["accent"],
+            fg_color=COLORS["border"],
+            button_color=COLORS["accent"],
+            button_hover_color=COLORS["accent_hover"],
+        )
+        self.audio_slider.configure(
+            state="normal" if Path(path).suffix.lower() == ".mp3" else "disabled"
+        )
+        self.audio_slider.set(0)
+        self.audio_slider.pack(side=LEFT, fill=X, expand=True)
 
         transcript_card = self._card(content)
         transcript_card.pack(fill=BOTH, expand=True)
@@ -1457,26 +1562,27 @@ class SummaraizerApp:
             padx=8,
             pady=4,
         ).pack(side=RIGHT)
-        transcript_area = Frame(transcript_card, background=COLORS["surface"])
-        transcript_area.pack(fill=BOTH, expand=True)
-        transcript_widget = Text(
-            transcript_area,
+        transcript_widget = TranscriptTextbox(
+            transcript_card,
             wrap="word",
             font=("Segoe UI", 10),
-            foreground=COLORS["text"],
-            background="#FAFBFC",
-            relief="solid",
-            borderwidth=1,
-            padx=12,
-            pady=12,
+            text_color=COLORS["body"],
+            fg_color="#FAFBFC",
+            border_color=COLORS["border"],
+            border_width=1,
+            corner_radius=8,
         )
-        transcript_scroll = ttk.Scrollbar(
-            transcript_area, orient=VERTICAL, command=transcript_widget.yview
-        )
-        transcript_widget.configure(yscrollcommand=transcript_scroll.set)
-        transcript_widget.pack(side=LEFT, fill=BOTH, expand=True)
-        transcript_scroll.pack(side=RIGHT, fill=Y)
+        transcript_widget.pack(fill=BOTH, expand=True)
         transcript_widget.insert("1.0", transcript)
+        transcript_widget._textbox.tag_configure(
+            "timestamp", foreground=COLORS["muted"]
+        )
+        for timestamp in re.finditer(r"\[\d{1,2}:\d{2}\]", transcript):
+            transcript_widget._textbox.tag_add(
+                "timestamp",
+                f"1.0 + {timestamp.start()} chars",
+                f"1.0 + {timestamp.end()} chars",
+            )
         self.transcription_editor = transcript_widget
         self.transcription_editor_path = path
 
@@ -1569,13 +1675,21 @@ class SummaraizerApp:
         try:
             if pygame.mixer.get_init() is None:
                 pygame.mixer.init()
+            try:
+                self.audio_duration_seconds = pygame.mixer.Sound(path).get_length()
+            except pygame.error:
+                self.audio_duration_seconds = 0.0
             pygame.mixer.music.load(path)
             pygame.mixer.music.play()
+            if self.audio_slider is not None:
+                self.audio_slider.set(0)
+            self._update_audio_position()
             if self.audio_status_label is not None:
                 status = self.audio_status_label.cget("text")
                 self.audio_status_label.configure(
                     text=status.replace("Ready to play", "Playing")
                 )
+            self._schedule_audio_position()
         except pygame.error as error:
             messagebox.showerror(
                 "Unable to play audio",
@@ -1595,6 +1709,9 @@ class SummaraizerApp:
             return
         if pygame.mixer.get_init() is not None and pygame.mixer.music.get_busy():
             pygame.mixer.music.pause()
+            if self.audio_position_after is not None:
+                self.root.after_cancel(self.audio_position_after)
+                self.audio_position_after = None
             if self.audio_status_label is not None:
                 self.audio_status_label.configure(
                     text=self.audio_status_label.cget("text").replace(
@@ -1603,6 +1720,7 @@ class SummaraizerApp:
                 )
         elif pygame.mixer.get_init() is not None:
             pygame.mixer.music.unpause()
+            self._schedule_audio_position()
             if self.audio_status_label is not None:
                 self.audio_status_label.configure(
                     text=self.audio_status_label.cget("text").replace(
@@ -1617,12 +1735,73 @@ class SummaraizerApp:
             return
         if pygame.mixer.get_init() is not None:
             pygame.mixer.music.stop()
+            if self.audio_position_after is not None:
+                self.root.after_cancel(self.audio_position_after)
+                self.audio_position_after = None
+            if self.audio_slider is not None and self.audio_slider.winfo_exists():
+                self.audio_slider.set(0)
+            if self.audio_time_label is not None and self.audio_time_label.winfo_exists():
+                self.audio_time_label.configure(
+                    text=f"0:00 / {self._format_audio_time(self.audio_duration_seconds)}"
+                )
             if self.audio_status_label is not None:
                 self.audio_status_label.configure(
                     text=self.audio_status_label.cget("text")
                     .replace("Playing", "Ready to play")
                     .replace("Paused", "Ready to play")
                 )
+
+    @staticmethod
+    def _format_audio_time(seconds: float) -> str:
+        total_seconds = max(0, int(seconds))
+        return f"{total_seconds // 60}:{total_seconds % 60:02d}"
+
+    def _seek_audio(self, position: float) -> None:
+        if self.audio_duration_seconds <= 0:
+            return
+        try:
+            import pygame
+        except ImportError:
+            return
+        if pygame.mixer.get_init() is None:
+            return
+        try:
+            pygame.mixer.music.set_pos(self.audio_duration_seconds * position)
+        except pygame.error as error:
+            messagebox.showerror(
+                "Unable to seek audio",
+                f"Could not seek in the current audio file:\n{error}",
+                parent=self.root,
+            )
+
+    def _schedule_audio_position(self) -> None:
+        if self.audio_position_after is None:
+            self.audio_position_after = self.root.after(500, self._update_audio_position)
+
+    def _update_audio_position(self) -> None:
+        self.audio_position_after = None
+        try:
+            import pygame
+        except ImportError:
+            return
+        if pygame.mixer.get_init() is None:
+            return
+        position_ms = pygame.mixer.music.get_pos()
+        if position_ms >= 0:
+            position_seconds = position_ms / 1000
+            if self.audio_slider is not None and self.audio_duration_seconds > 0:
+                self.audio_slider.set(
+                    min(1.0, position_seconds / self.audio_duration_seconds)
+                )
+            if self.audio_time_label is not None:
+                self.audio_time_label.configure(
+                    text=(
+                        f"{self._format_audio_time(position_seconds)} / "
+                        f"{self._format_audio_time(self.audio_duration_seconds)}"
+                    )
+                )
+        if pygame.mixer.music.get_busy():
+            self._schedule_audio_position()
 
     def _read_source_file_content(self, path: str | Path) -> str:
         target = Path(path)
@@ -1736,24 +1915,23 @@ class SummaraizerApp:
         split_area.rowconfigure(0, weight=1)
 
         # Left pane: Source File
-        left_pane = Frame(
+        left_pane = ctk.CTkFrame(
             split_area,
-            background=COLORS["surface"],
-            highlightbackground=COLORS["border"],
-            highlightthickness=1,
-            padx=10,
-            pady=8,
+            fg_color=COLORS["surface"],
+            border_color=COLORS["border"],
+            border_width=1,
+            corner_radius=8,
         )
         left_pane.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
 
-        left_header = Frame(left_pane, background=COLORS["surface"])
+        left_header = Frame(left_pane, background="#F1F5F9")
         left_header.pack(fill=X, pady=(0, 6))
         Label(
             left_header,
             text="Source Text File",
             font=("Segoe UI", 10, "bold"),
             foreground=COLORS["text"],
-            background=COLORS["surface"],
+            background="#F1F5F9",
         ).pack(side=LEFT)
         self._button(
             left_header,
@@ -1785,24 +1963,23 @@ class SummaraizerApp:
         source_widget.configure(state="disabled")
 
         # Right pane: Generated Summary
-        right_pane = Frame(
+        right_pane = ctk.CTkFrame(
             split_area,
-            background=COLORS["surface"],
-            highlightbackground=COLORS["border"],
-            highlightthickness=1,
-            padx=10,
-            pady=8,
+            fg_color=COLORS["surface"],
+            border_color=COLORS["border"],
+            border_width=1,
+            corner_radius=8,
         )
         right_pane.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
-        right_header = Frame(right_pane, background=COLORS["surface"])
+        right_header = Frame(right_pane, background="#EEF2FF")
         right_header.pack(fill=X, pady=(0, 6))
         Label(
             right_header,
             text="Generated Summary",
             font=("Segoe UI", 10, "bold"),
             foreground=COLORS["text"],
-            background=COLORS["surface"],
+            background="#EEF2FF",
         ).pack(side=LEFT)
         self._button(
             right_header,
@@ -1834,6 +2011,13 @@ class SummaraizerApp:
         summary_widget.insert("1.0", summary_text)
         self.summary_editor = summary_widget
         self.summary_editor_path = path
+        self.summary_progress = ctk.CTkProgressBar(
+            right_pane,
+            mode="indeterminate",
+            height=5,
+            progress_color=COLORS["accent"],
+            fg_color=COLORS["accent_light"],
+        )
 
         # Controls right below the split screen:
         controls = Frame(content, background=COLORS["background"])
@@ -1909,6 +2093,7 @@ class SummaraizerApp:
             editor is None
             or path is None
             or not editor.winfo_exists()
+            or self.summary_streaming_path == path
         ):
             return
         text = editor.get("1.0", "end-1c").strip()
@@ -1931,16 +2116,63 @@ class SummaraizerApp:
         self.show_page("viewer")
 
     def _generate_summary(self, path: str) -> None:
-        if self._require_compilation() is None:
+        compilation = self._require_compilation()
+        if compilation is None:
             return
         self._stage_current_summary()
-        self.summary_drafts[path] = mock_summary(
-            path,
-            self.active_compilation.transcriptions.get(path, "")
-            if self.active_compilation is not None
-            else "",
+        generated = mock_summary(
+            path, compilation.transcriptions.get(path, "")
         )
-        self.show_page("summary")
+        editor = self.summary_editor
+        progress = self.summary_progress
+        if (
+            editor is None
+            or progress is None
+            or not editor.winfo_exists()
+            or self.summary_editor_path != path
+        ):
+            self.summary_drafts[path] = generated
+            self.show_page("summary")
+            return
+        editor.configure(state="normal")
+        editor.delete("1.0", "end")
+        self.summary_drafts[path] = generated
+        self.summary_streaming_path = path
+        self.summary_stream_generation += 1
+        generation = self.summary_stream_generation
+        progress.pack(fill=X, pady=(8, 0))
+        progress.start()
+        self._stream_summary_text(path, generated, generation)
+
+    def _stream_summary_text(
+        self, path: str, generated: str, generation: int, offset: int = 0
+    ) -> None:
+        if generation != self.summary_stream_generation:
+            return
+        editor = self.summary_editor
+        progress = self.summary_progress
+        if (
+            editor is None
+            or progress is None
+            or not editor.winfo_exists()
+            or self.summary_editor_path != path
+        ):
+            return
+        next_offset = min(offset + 48, len(generated))
+        editor.insert("end", generated[offset:next_offset])
+        editor.see("end")
+        if next_offset < len(generated):
+            self.summary_stream_after = self.root.after(
+                24,
+                lambda: self._stream_summary_text(
+                    path, generated, generation, next_offset
+                ),
+            )
+            return
+        self.summary_stream_after = None
+        self.summary_streaming_path = None
+        progress.stop()
+        progress.pack_forget()
 
     def _finalize_summary(self) -> None:
         compilation = self._require_compilation()
@@ -2059,13 +2291,11 @@ class SummaraizerApp:
                 pady=18,
             ).pack(anchor="w")
         for message_index, (speaker, text) in enumerate(self.chat_messages):
-            message = Frame(
+            message_background = COLORS["accent"] if speaker == "You" else "#F1F5F9"
+            message = ctk.CTkFrame(
                 conversation.content,
-                background=COLORS["accent_light"]
-                if speaker == "You"
-                else "#F1F3F5",
-                padx=12,
-                pady=10,
+                fg_color=message_background,
+                corner_radius=10,
             )
             message.pack(
                 anchor="e" if speaker == "You" else "w",
@@ -2076,18 +2306,22 @@ class SummaraizerApp:
                 message,
                 text=speaker,
                 font=("Segoe UI", 8, "bold"),
-                foreground=COLORS["accent"] if speaker == "You" else COLORS["muted"],
-                background=message.cget("background"),
+                foreground="#FFFFFF" if speaker == "You" else COLORS["muted"],
+                background=message_background,
+                padx=12,
+                pady=4,
             ).pack(anchor="w")
             Label(
                 message,
                 text=text,
                 font=("Segoe UI", 10),
-                foreground=COLORS["text"],
-                background=message.cget("background"),
+                foreground="#FFFFFF" if speaker == "You" else COLORS["body"],
+                background=message_background,
                 justify=LEFT,
                 wraplength=650,
-            ).pack(anchor="w", pady=(3, 0))
+                padx=12,
+                pady=8,
+            ).pack(anchor="w")
             if message_index in self.retryable_chat_responses:
                 self._button(
                     message,
@@ -2109,7 +2343,7 @@ class SummaraizerApp:
         entry.pack(side=LEFT, fill=X, expand=True, ipady=9, padx=(0, 10))
 
         self._button(
-            composer, "Send", self._send_chat_message, primary=True
+            composer, "➤  Send", self._send_chat_message, primary=True
         ).pack(side=RIGHT)
         self._button(
             composer, "Close", self._close_chat

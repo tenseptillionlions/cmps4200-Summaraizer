@@ -198,7 +198,7 @@ class GuiIntuitionTests(unittest.TestCase):
         save_edits_btns = [b for b in buttons if b.cget("text") == "Save Edits"]
         self.assertEqual(len(save_edits_btns), 1)
         save_edits_btn = save_edits_btns[0]
-        self.assertEqual(save_edits_btn.cget("background"), COLORS["accent"])
+        self.assertEqual(save_edits_btn.cget("background"), COLORS["success"])
 
         # User edits transcription and saves
         self.assertIsNotNone(self.app.transcription_editor)
@@ -309,6 +309,49 @@ class GuiIntuitionTests(unittest.TestCase):
             label.cget("text") for label in self._find_labels(self.app.page_container)
         ]
         self.assertNotIn("Master summary finalized", finalized_labels)
+
+    def test_summary_regeneration_streams_into_editor(self) -> None:
+        source = Path(self.temp_dir.name) / "streamed.txt"
+        source.write_text("A source document.", encoding="utf-8")
+        source_path = str(source.resolve())
+        self.compilation.files = [source_path]
+
+        self.app.show_page("summary")
+        self.app._generate_summary(source_path)
+
+        generated = self.app.summary_drafts[source_path]
+        self.assertIsNotNone(self.app.summary_progress)
+        self.assertLess(
+            len(self.app.summary_editor.get("1.0", "end-1c")),
+            len(generated),
+        )
+        while self.app.summary_streaming_path is not None:
+            if self.app.summary_stream_after is not None:
+                self.root.after_cancel(self.app.summary_stream_after)
+                self.app.summary_stream_after = None
+            offset = len(self.app.summary_editor.get("1.0", "end-1c"))
+            self.app._stream_summary_text(
+                source_path,
+                generated,
+                self.app.summary_stream_generation,
+                offset,
+            )
+
+        self.assertIsNone(self.app.summary_streaming_path)
+        self.assertEqual(
+            self.app.summary_editor.get("1.0", "end-1c"),
+            generated,
+        )
+
+    def test_chat_page_keeps_send_flow(self) -> None:
+        self.app.show_page("chat")
+        self.app.chat_entry.insert(0, "What is in this compilation?")
+
+        self.app._send_chat_message()
+
+        self.assertEqual(self.app.active_page, "chat")
+        self.assertEqual(self.app.chat_messages[0][0], "You")
+        self.assertEqual(self.app.chat_messages[0][1], "What is in this compilation?")
 
 if __name__ == "__main__":
     unittest.main()

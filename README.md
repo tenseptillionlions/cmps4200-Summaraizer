@@ -7,7 +7,7 @@ is used.
 
 ## Run
 
-Use Python 3.10 or later. Install the audio playback dependency, then launch the
+Use Python 3.10 or later. Install the UI and audio dependencies, then launch the
 app:
 
 ```powershell
@@ -15,10 +15,10 @@ python -m pip install -r requirements.txt
 python summaraizer_app.py
 ```
 
-The GUI uses Tkinter, which is included with most Python distributions. Audio
-playback supports the common formats accepted by pygame. Compilation names,
-file paths, sample transcriptions, and summaries are saved locally in
-`~/.summaraizer/compilations.json`. Finalized compilations also save
+The interface combines Tkinter's native event loop with CustomTkinter cards and
+Pillow-rendered icons. Audio playback supports the common formats accepted by
+pygame. Compilation names, file paths, sample transcriptions, and summaries are
+saved locally in `~/.summaraizer/compilations.json`. Finalized compilations also save
 `Summary.txt` under their app data folder, and the viewer displays its contents.
 
 Supported input file extensions match the design: `.txt` and `.pdf` documents,
