@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -264,8 +266,12 @@ class SummaraizerApp:
         self.summary_editor: Text | None = None
         self.summary_editor_path: str | None = None
         self.summary_drafts: dict[str, str] = {}
+        self.transcription_editor: Text | None = None
+        self.transcription_editor_path: str | None = None
         self.audio_status_label: Label | None = None
         self.transcription_drafts: dict[str, str] = {}
+        self._c_wnd_proc: object | None = None
+        self._old_wnd_proc: object | None = None
         self.chat_entry: Entry | None = None
         self.chat_messages: list[tuple[str, str]] = []
         self.retryable_chat_responses: set[int] = set()
@@ -278,6 +284,7 @@ class SummaraizerApp:
         self.root.minsize(940, 620)
         self.root.configure(background=COLORS["background"])
         self._build_shell()
+        self._setup_drag_and_drop()
         self.show_page("home")
 
     def _configure_styles(self) -> None:
@@ -331,6 +338,120 @@ class SummaraizerApp:
         self.page_container = Frame(main, background=COLORS["background"])
         self.page_container.pack(fill=BOTH, expand=True)
 
+    def _setup_drag_and_drop(self) -> None:
+        try:
+            import windnd  # type: ignore
+
+            windnd.hook_dropfiles(self.root, func=self._on_windnd_drop)
+            return
+        except Exception:
+            pass
+
+        if sys.platform == "win32":
+            try:
+                self._setup_native_drag_drop()
+            except Exception:
+                pass
+
+    def _on_windnd_drop(self, files: list[bytes | str]) -> None:
+        decoded: list[str] = [
+            f.decode("utf-8", errors="replace") if isinstance(f, bytes) else str(f)
+            for f in files
+        ]
+        self._on_files_dropped(decoded)
+
+    def _setup_native_drag_drop(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
+
+        try:
+            self.root.update_idletasks()
+            hwnd = self.root.winfo_id()
+            if not hwnd:
+                return
+            shell32.DragAcceptFiles(hwnd, True)
+        except Exception:
+            return
+
+        WNDPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t,
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        )
+        GWLP_WNDPROC = -4
+        WM_DROPFILES = 0x0233
+
+        SetWindowLongPtr = getattr(
+            user32, "SetWindowLongPtrW", getattr(user32, "SetWindowLongW", None)
+        )
+        if not SetWindowLongPtr:
+            return
+        SetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        SetWindowLongPtr.restype = ctypes.c_void_p
+
+        CallWindowProc = user32.CallWindowProcW
+        CallWindowProc.argtypes = [
+            ctypes.c_void_p,
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        CallWindowProc.restype = ctypes.c_ssize_t
+
+        shell32.DragQueryFileW.argtypes = [
+            wintypes.WPARAM,
+            wintypes.UINT,
+            wintypes.LPWSTR,
+            wintypes.UINT,
+        ]
+        shell32.DragQueryFileW.restype = wintypes.UINT
+        shell32.DragFinish.argtypes = [wintypes.WPARAM]
+        shell32.DragFinish.restype = None
+
+        def wnd_proc(hWnd: int, msg: int, wParam: int, lParam: int) -> int:
+            if msg == WM_DROPFILES:
+                hdrop = wParam
+                try:
+                    count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+                    dropped: list[str] = []
+                    for i in range(count):
+                        length = shell32.DragQueryFileW(hdrop, i, None, 0)
+                        buf = ctypes.create_unicode_buffer(length + 1)
+                        shell32.DragQueryFileW(hdrop, i, buf, length + 1)
+                        dropped.append(buf.value)
+                    shell32.DragFinish(hdrop)
+                    self.root.after(0, lambda: self._on_files_dropped(dropped))
+                except Exception:
+                    pass
+                return 0
+            return CallWindowProc(old_wnd_proc, hWnd, msg, wParam, lParam)
+
+        self._c_wnd_proc = WNDPROC(wnd_proc)
+        old_wnd_proc = SetWindowLongPtr(
+            hwnd, GWLP_WNDPROC, ctypes.cast(self._c_wnd_proc, ctypes.c_void_p)
+        )
+        self._old_wnd_proc = old_wnd_proc
+
+        def cleanup() -> None:
+            try:
+                if self._old_wnd_proc and SetWindowLongPtr:
+                    SetWindowLongPtr(hwnd, GWLP_WNDPROC, self._old_wnd_proc)
+            except Exception:
+                pass
+
+        self.root.bind("<Destroy>", lambda _e: cleanup(), add="+")
+
+    def _on_files_dropped(self, files: list[str]) -> None:
+        if self.active_page != "viewer" or self.active_compilation is None:
+            return
+        self._add_file_paths(files)
+
     def _persist(self) -> None:
         self.store.save(self.compilations)
 
@@ -351,15 +472,32 @@ class SummaraizerApp:
 
     def show_page(self, page: str) -> None:
         previous_page = self.active_page
-        if page == "summary" and previous_page != "summary":
-            compilation = self.active_compilation
-            self.summary_drafts = (
-                dict(compilation.summaries) if compilation is not None else {}
-            )
-        if page == "transcription" and previous_page != "transcription":
+        if page == "summary":
             compilation = self.active_compilation
             if compilation is not None:
-                self.transcription_drafts = dict(compilation.transcriptions)
+                if previous_page != "summary":
+                    self.summary_drafts = dict(compilation.summaries)
+                for s_path in compilation.summary_files:
+                    if (
+                        s_path not in self.summary_drafts
+                        or not self.summary_drafts[s_path].strip()
+                    ):
+                        transcription = compilation.transcriptions.get(s_path, "")
+                        self.summary_drafts[s_path] = mock_summary(
+                            s_path, transcription
+                        )
+        if page == "transcription":
+            compilation = self.active_compilation
+            if compilation is not None:
+                if previous_page != "transcription":
+                    self.transcription_drafts = dict(compilation.transcriptions)
+                for a_path in compilation.audio_files:
+                    if (
+                        a_path not in self.transcription_drafts
+                        or not self.transcription_drafts[a_path].strip()
+                    ):
+                        sample, _ = mock_transcription(a_path)
+                        self.transcription_drafts[a_path] = sample
         self.active_page = page
         for child in self.page_container.winfo_children():
             child.destroy()
@@ -407,16 +545,26 @@ class SummaraizerApp:
         *,
         primary: bool = False,
         compact: bool = False,
+        large: bool = False,
+        padx: int | None = None,
+        pady: int | None = None,
+        font_size: int | None = None,
     ) -> Button:
+        if padx is None:
+            padx = 22 if large else (10 if compact else 16)
+        if pady is None:
+            pady = 12 if large else (6 if compact else 10)
+        if font_size is None:
+            font_size = 11 if large else (8 if compact else 9)
         button = Button(
             parent,
             text=text,
             command=command,
-            font=("Segoe UI", 9, "bold" if primary else "normal"),
+            font=("Segoe UI", font_size, "bold" if (primary or large) else "normal"),
             relief="flat",
             borderwidth=0,
-            padx=16 if not compact else 10,
-            pady=10 if not compact else 6,
+            padx=padx,
+            pady=pady,
             cursor="hand2",
             background=COLORS["accent"] if primary else COLORS["surface"],
             foreground="#FFFFFF" if primary else COLORS["text"],
@@ -746,7 +894,12 @@ class SummaraizerApp:
                 ("All files", "*.*"),
             ],
         )
-        if not paths:
+        if paths:
+            self._add_file_paths(list(paths))
+
+    def _add_file_paths(self, paths: list[str | Path]) -> None:
+        compilation = self._require_compilation()
+        if compilation is None or not paths:
             return
         invalid: list[str] = []
         added = 0
@@ -795,6 +948,87 @@ class SummaraizerApp:
                 parent=self.root,
             )
 
+    def _open_file(self, path: str | Path) -> None:
+        target = Path(path).resolve()
+        if not target.exists():
+            messagebox.showerror(
+                "File not found",
+                f"The file does not exist on disk:\n{target}",
+                parent=self.root,
+            )
+            return
+        opened = False
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(str(target))
+                opened = True
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+                opened = True
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+                opened = True
+        except Exception:
+            opened = False
+
+        if not opened:
+            if target.suffix.lower() == ".txt":
+                self._preview_text_file(target)
+            else:
+                messagebox.showerror(
+                    "Unable to open file",
+                    f"Could not open {target.name} with default application.",
+                    parent=self.root,
+                )
+
+    def _preview_text_file(self, target: Path) -> None:
+        dialog = Toplevel(self.root)
+        dialog.title(target.name)
+        dialog.geometry("640x480")
+        dialog.transient(self.root)
+        dialog.configure(background=COLORS["background"])
+
+        content = Frame(dialog, background=COLORS["background"], padx=20, pady=18)
+        content.pack(fill=BOTH, expand=True)
+
+        Label(
+            content,
+            text=target.name,
+            font=("Segoe UI", 14, "bold"),
+            foreground=COLORS["text"],
+            background=COLORS["background"],
+        ).pack(anchor="w", pady=(0, 10))
+
+        text_area = Frame(content, background=COLORS["surface"])
+        text_area.pack(fill=BOTH, expand=True)
+
+        preview = Text(
+            text_area,
+            wrap="word",
+            font=("Segoe UI", 10),
+            foreground=COLORS["text"],
+            background=COLORS["surface"],
+            relief="flat",
+            padx=12,
+            pady=12,
+        )
+        scrollbar = ttk.Scrollbar(text_area, orient=VERTICAL, command=preview.yview)
+        preview.configure(yscrollcommand=scrollbar.set)
+        preview.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=RIGHT, fill=Y)
+
+        try:
+            content_text = target.read_text(encoding="utf-8")
+        except Exception:
+            content_text = target.read_text(encoding="latin-1", errors="replace")
+
+        preview.insert("1.0", content_text)
+        preview.configure(state="disabled")
+
+        actions = Frame(content, background=COLORS["background"])
+        actions.pack(fill=X, pady=(12, 0))
+        self._button(actions, "Close", dialog.destroy).pack(side=RIGHT)
+
     def _render_viewer(self) -> None:
         compilation = self._require_compilation()
         if compilation is None:
@@ -806,10 +1040,78 @@ class SummaraizerApp:
         self._button(
             intro, "+  Add files", self._choose_files, primary=True
         ).pack(side=RIGHT, anchor="e")
-        panel = self._card(self.page_container)
+
+        # Bottom actions bar packed with side="bottom" first so it is always visible!
+        actions = Frame(self.page_container, background=COLORS["background"])
+        actions.pack(side="bottom", fill=X, padx=34, pady=(10, 20))
+        self._button(
+            actions, "Return to Home", lambda: self.show_page("home")
+        ).pack(side=LEFT)
+
+        has_transcripts = bool(compilation.audio_files) or any(
+            f.endswith("-transcript.txt") for f in compilation.files
+        )
+
+        if compilation.master_summary:
+            # Summary is finalized: Deep Dive becomes the primary button
+            self._button(
+                actions,
+                "Deep Dive",
+                lambda: self.show_page("chat"),
+                primary=True,
+            ).pack(side=RIGHT)
+
+            # Summary Generation remains available to regenerate summary
+            self._button(
+                actions,
+                "Summary Generation",
+                lambda: self.show_page("summary"),
+            ).pack(side=RIGHT, padx=(0, 8))
+
+            # Transcript viewing remains available
+            if has_transcripts:
+                self._button(
+                    actions,
+                    "Transcript viewing",
+                    self._continue_from_viewer,
+                ).pack(side=RIGHT, padx=(0, 8))
+
+            self._button(
+                actions,
+                "Export summary",
+                self._export_master_summary,
+            ).pack(side=RIGHT, padx=(0, 8))
+            self._button(
+                actions,
+                "View summary",
+                self._show_master_summary,
+            ).pack(side=RIGHT, padx=(0, 8))
+        else:
+            # Not finalized: Summary Generation is primary
+            self._button(
+                actions,
+                "Summary Generation",
+                lambda: self.show_page("summary"),
+                primary=True,
+            ).pack(side=RIGHT)
+
+            if has_transcripts:
+                self._button(
+                    actions,
+                    "Transcript viewing" if not compilation.audio_files else "Audio Transcriptions",
+                    self._continue_from_viewer,
+                ).pack(side=RIGHT, padx=(0, 8))
+
+            self._button(
+                actions,
+                "Deep Dive",
+                lambda: self.show_page("chat"),
+            ).pack(side=RIGHT, padx=(0, 8))
+
+        # Top summary card if finalized
         if compilation.master_summary:
             summary_card = self._card(self.page_container)
-            summary_card.pack(fill=X, padx=34, pady=(0, 14))
+            summary_card.pack(side="top", fill=X, padx=34, pady=(0, 12))
             summary_header = Frame(summary_card, background=COLORS["surface"])
             summary_header.pack(fill=X, pady=(0, 8))
             Label(
@@ -827,6 +1129,12 @@ class SummaraizerApp:
                 foreground=COLORS["muted"],
                 background=COLORS["surface"],
             ).pack(side=LEFT, padx=(10, 0))
+            self._button(
+                summary_header,
+                "Open",
+                lambda p=summary_path: self._open_file(p),
+                compact=True,
+            ).pack(side=RIGHT)
             summary_text = (
                 summary_path.read_text(encoding="utf-8")
                 if summary_path.is_file()
@@ -836,7 +1144,7 @@ class SummaraizerApp:
             summary_area.pack(fill=X)
             summary_content = Text(
                 summary_area,
-                height=7,
+                height=5,
                 wrap="word",
                 font=("Segoe UI", 9),
                 foreground=COLORS["text"],
@@ -855,7 +1163,10 @@ class SummaraizerApp:
             summary_scroll.pack(side=RIGHT, fill=Y)
             summary_content.insert("1.0", summary_text)
             summary_content.configure(state="disabled")
-        panel.pack(fill=BOTH, expand=True, padx=34, pady=(0, 18))
+
+        # Files panel takes remaining space in the middle
+        panel = self._card(self.page_container)
+        panel.pack(side="top", fill=BOTH, expand=True, padx=34, pady=(0, 12))
         header = Frame(panel, background=COLORS["surface"])
         header.pack(fill=X, pady=(0, 12))
         Label(
@@ -872,6 +1183,34 @@ class SummaraizerApp:
             foreground=COLORS["muted"],
             background=COLORS["surface"],
         ).pack(side=RIGHT)
+
+        drop_zone = Frame(
+            panel,
+            background="#F0F4FF",
+            highlightbackground=COLORS["accent"],
+            highlightthickness=1,
+            padx=14,
+            pady=12,
+            cursor="hand2",
+        )
+        drop_zone.pack(fill=X, pady=(0, 12))
+        Label(
+            drop_zone,
+            text="📁 Drag & drop files here to add them to this compilation",
+            font=("Segoe UI", 10, "bold"),
+            foreground=COLORS["accent"],
+            background="#F0F4FF",
+        ).pack(anchor="center")
+        Label(
+            drop_zone,
+            text="Supported types: .txt, .pdf, .mp3, .wav  (or click to browse)",
+            font=("Segoe UI", 8),
+            foreground=COLORS["muted"],
+            background="#F0F4FF",
+        ).pack(anchor="center", pady=(2, 0))
+        drop_zone.bind("<Button-1>", lambda _e: self._choose_files())
+        for child in drop_zone.winfo_children():
+            child.bind("<Button-1>", lambda _e: self._choose_files())
 
         if not compilation.files:
             Label(
@@ -929,42 +1268,17 @@ class SummaraizerApp:
                     lambda selected=path: self._remove_file(selected),
                     compact=True,
                 ).pack(side=RIGHT)
+                self._button(
+                    row,
+                    "Open",
+                    lambda selected=path: self._open_file(selected),
+                    compact=True,
+                ).pack(side=RIGHT, padx=(0, 6))
 
-        actions = Frame(self.page_container, background=COLORS["background"])
-        actions.pack(fill=X, padx=34, pady=(0, 24))
-        self._button(
-            actions, "Return to Home", lambda: self.show_page("home")
-        ).pack(
-            side=LEFT
-        )
-        self._button(
-            actions,
-            "Summary Generation",
-            lambda: self.show_page("summary"),
-            primary=True,
-        ).pack(side=RIGHT, padx=(0, 8))
-        if compilation.audio_files:
-            self._button(
-                actions,
-                "Audio Transcriptions",
-                self._continue_from_viewer,
-            ).pack(side=RIGHT, padx=(0, 8))
-        self._button(
-            actions,
-            "Deep Dive",
-            lambda: self.show_page("chat"),
-        ).pack(side=RIGHT, padx=(0, 8))
-        if compilation.master_summary:
-            self._button(
-                actions,
-                "View summary",
-                self._show_master_summary,
-            ).pack(side=RIGHT, padx=(0, 8))
-            self._button(
-                actions,
-                "Export summary",
-                self._export_master_summary,
-            ).pack(side=RIGHT, padx=(0, 8))
+                row.bind("<Double-Button-1>", lambda _e, p=path: self._open_file(p))
+                detail.bind("<Double-Button-1>", lambda _e, p=path: self._open_file(p))
+                for w in detail.winfo_children():
+                    w.bind("<Double-Button-1>", lambda _e, p=path: self._open_file(p))
 
     def _remove_file(self, path: str) -> None:
         compilation = self._require_compilation()
@@ -975,6 +1289,8 @@ class SummaraizerApp:
         if path in compilation.accepted_transcriptions:
             compilation.accepted_transcriptions.remove(path)
         compilation.summaries.pop(path, None)
+        self.summary_drafts.pop(path, None)
+        self.transcription_drafts.pop(path, None)
         compilation.master_summary = ""
         self._persist()
         self.show_page("viewer")
@@ -1025,10 +1341,10 @@ class SummaraizerApp:
             foreground=COLORS["text"],
             background=COLORS["surface"],
         ).pack(anchor="w", pady=(0, 10))
-        for index, path in enumerate(audio_files):
+        for index, a_path in enumerate(audio_files):
             self._button(
                 files_panel,
-                f"{'●  ' if index == self.audio_index else ''}{Path(path).name}",
+                f"{'●  ' if index == self.audio_index else ''}{Path(a_path).name}",
                 lambda selected=index: self._select_audio(selected),
                 primary=index == self.audio_index,
             ).pack(fill=X, pady=(0, 7))
@@ -1039,6 +1355,11 @@ class SummaraizerApp:
         transcript = self.transcription_drafts.get(
             path, compilation.transcriptions.get(path, "")
         )
+        if not transcript:
+            sample, _ = mock_transcription(path)
+            self.transcription_drafts[path] = sample
+            transcript = sample
+
         audio_card = self._card(content)
         audio_card.pack(fill=X, pady=(0, 12))
         audio_header = Frame(audio_card, background=COLORS["surface"])
@@ -1091,15 +1412,15 @@ class SummaraizerApp:
         actions.pack(side=RIGHT, padx=(8, 0))
         self._button(
             actions,
-            "Generate",
-            lambda selected=path: self._generate_transcription(selected),
+            "Save Edits",
+            lambda selected=path: self._save_transcription(selected),
             primary=True,
             compact=True,
         ).pack(side=RIGHT, padx=(6, 0))
         self._button(
             actions,
-            "Save",
-            lambda selected=path: self._save_transcription(selected),
+            "Reset sample",
+            lambda selected=path: self._generate_transcription(selected),
             compact=True,
         ).pack(side=RIGHT, padx=(6, 0))
         self._button(
@@ -1120,23 +1441,22 @@ class SummaraizerApp:
             foreground=COLORS["text"],
             background=COLORS["surface"],
         ).pack(side=LEFT)
-        low_confidence = transcript.startswith("[Low confidence]") or transcript.startswith(
-            "No speech could be detected"
-        )
-        if transcript:
-            badge_text = "Low confidence" if low_confidence else "Sample result"
-            badge_color = COLORS["warning"] if low_confidence else COLORS["success"]
-            Label(
-                transcript_header,
-                text=badge_text,
-                font=("Segoe UI", 9, "bold"),
-                foreground=badge_color,
-                background=(
-                    COLORS["warning_light"] if low_confidence else COLORS["success_light"]
-                ),
-                padx=8,
-                pady=4,
-            ).pack(side=RIGHT)
+        low_confidence = transcript.startswith(
+            "[Low confidence]"
+        ) or transcript.startswith("No speech could be detected")
+        badge_text = "Low confidence" if low_confidence else "Sample result"
+        badge_color = COLORS["warning"] if low_confidence else COLORS["success"]
+        Label(
+            transcript_header,
+            text=badge_text,
+            font=("Segoe UI", 9, "bold"),
+            foreground=badge_color,
+            background=(
+                COLORS["warning_light"] if low_confidence else COLORS["success_light"]
+            ),
+            padx=8,
+            pady=4,
+        ).pack(side=RIGHT)
         transcript_area = Frame(transcript_card, background=COLORS["surface"])
         transcript_area.pack(fill=BOTH, expand=True)
         transcript_widget = Text(
@@ -1145,7 +1465,8 @@ class SummaraizerApp:
             font=("Segoe UI", 10),
             foreground=COLORS["text"],
             background="#FAFBFC",
-            relief="flat",
+            relief="solid",
+            borderwidth=1,
             padx=12,
             pady=12,
         )
@@ -1155,12 +1476,24 @@ class SummaraizerApp:
         transcript_widget.configure(yscrollcommand=transcript_scroll.set)
         transcript_widget.pack(side=LEFT, fill=BOTH, expand=True)
         transcript_scroll.pack(side=RIGHT, fill=Y)
-        transcript_widget.insert("1.0", transcript or "Generate a sample transcription.")
-        transcript_widget.configure(state="disabled")
+        transcript_widget.insert("1.0", transcript)
+        self.transcription_editor = transcript_widget
+        self.transcription_editor_path = path
 
     def _select_audio(self, index: int) -> None:
         self._stop_audio()
-        self.audio_index = index
+        compilation = self.active_compilation
+        if (
+            compilation is not None
+            and self.transcription_editor is not None
+            and self.transcription_editor.winfo_exists()
+            and 0 <= self.audio_index < len(compilation.audio_files)
+        ):
+            current_path = compilation.audio_files[self.audio_index]
+            self.transcription_drafts[current_path] = self.transcription_editor.get(
+                "1.0", "end-1c"
+            )
+        self.audio_index = max(0, min(index, len(compilation.audio_files) - 1)) if compilation and compilation.audio_files else 0
         self.show_page("transcription")
 
     def _generate_transcription(self, path: str) -> None:
@@ -1181,13 +1514,19 @@ class SummaraizerApp:
         compilation = self._require_compilation()
         if compilation is None:
             return
-        transcript = self.transcription_drafts.get(
-            path, compilation.transcriptions.get(path)
-        )
+        if (
+            self.transcription_editor is not None
+            and self.transcription_editor.winfo_exists()
+        ):
+            transcript = self.transcription_editor.get("1.0", "end-1c").strip()
+        else:
+            transcript = self.transcription_drafts.get(
+                path, compilation.transcriptions.get(path, "")
+            ).strip()
         if not transcript:
             messagebox.showinfo(
                 "No transcript to save",
-                "Generate a transcript before saving it.",
+                "Enter or generate a transcript before saving it.",
                 parent=self.root,
             )
             return
@@ -1202,8 +1541,9 @@ class SummaraizerApp:
             )
             return
         compilation.transcriptions[path] = transcript
-        if str(transcript_path) not in compilation.files:
-            compilation.files.append(str(transcript_path))
+        resolved_transcript = str(transcript_path.resolve())
+        if resolved_transcript not in compilation.files:
+            compilation.files.append(resolved_transcript)
         if path not in compilation.accepted_transcriptions:
             compilation.accepted_transcriptions.append(path)
         compilation.master_summary = ""
@@ -1284,6 +1624,29 @@ class SummaraizerApp:
                     .replace("Paused", "Ready to play")
                 )
 
+    def _read_source_file_content(self, path: str | Path) -> str:
+        target = Path(path)
+        if not target.exists():
+            return f"[Source file not found on disk:\n{target}]"
+        suffix = target.suffix.lower()
+        if suffix == ".txt":
+            try:
+                return target.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                try:
+                    return target.read_text(encoding="latin-1", errors="replace")
+                except Exception as error:
+                    return f"[Unable to read text file:\n{error}]"
+        elif suffix == ".pdf":
+            return (
+                f"[PDF Document: {target.name}]\n"
+                f"Path: {target}\n"
+                f"Size: {target.stat().st_size:,} bytes\n\n"
+                "This is a PDF document. To view the original formatted layout and pages, "
+                "click 'Open file' above to view in your default PDF reader."
+            )
+        return f"[File type {suffix} is not a document file]"
+
     def _render_summary(self) -> None:
         compilation = self._require_compilation()
         if compilation is None:
@@ -1305,10 +1668,14 @@ class SummaraizerApp:
             "Summary generation",
             "Generate a sample summary for each file, then finalize a compilation summary.",
         )
+
+        # Body packed fill=BOTH, expand=True
         body = Frame(self.page_container, background=COLORS["background"])
-        body.pack(fill=BOTH, expand=True, padx=34, pady=(0, 16))
+        body.pack(side="top", fill=BOTH, expand=True, padx=34, pady=(0, 10))
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
+
+        # Left files panel (sidebar file traversal buttons)
         files_panel = self._card(body, width=285)
         files_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
         files_panel.grid_propagate(False)
@@ -1319,38 +1686,133 @@ class SummaraizerApp:
             foreground=COLORS["text"],
             background=COLORS["surface"],
         ).pack(anchor="w", pady=(0, 10))
-        for index, path in enumerate(files):
-            done = path in self.summary_drafts
-            label = f"{'✓' if done else '○'}  {Path(path).name}"
+        for index, s_path in enumerate(files):
+            done = s_path in self.summary_drafts and bool(self.summary_drafts[s_path].strip())
+            label = f"{'✓' if done else '○'}  {Path(s_path).name}"
             self._button(
                 files_panel,
                 label,
                 lambda selected=index: self._select_summary_file(selected),
                 primary=index == self.summary_index,
+                pady=11,
+                font_size=10,
             ).pack(fill=X, pady=(0, 7))
 
         content = Frame(body, background=COLORS["background"])
         content.grid(row=0, column=1, sticky="nsew")
+        content.rowconfigure(0, weight=1)
+        content.columnconfigure(0, weight=1)
         path = files[self.summary_index]
         summary_card = self._card(content)
-        summary_card.pack(fill=BOTH, expand=True)
+        summary_card.grid(row=0, column=0, sticky="nsew")
+
+        card_header = Frame(summary_card, background=COLORS["surface"])
+        card_header.pack(fill=X, pady=(0, 10))
         Label(
-            summary_card,
+            card_header,
             text=Path(path).name,
             font=("Segoe UI", 12, "bold"),
             foreground=COLORS["text"],
             background=COLORS["surface"],
-        ).pack(anchor="w", pady=(0, 12))
+        ).pack(side=LEFT)
+        Label(
+            card_header,
+            text="Split-screen comparison: Source file vs Generated summary",
+            font=("Segoe UI", 9),
+            foreground=COLORS["muted"],
+            background=COLORS["surface"],
+        ).pack(side=LEFT, padx=(12, 0))
+
         summary_text = self.summary_drafts.get(path, "")
         if not summary_text:
-            Label(
-                summary_card,
-                text="Generate a sample summary or enter your own below.",
-                font=("Segoe UI", 9),
-                foreground=COLORS["muted"],
-                background=COLORS["surface"],
-            ).pack(anchor="w", pady=(0, 8))
-        summary_area = Frame(summary_card, background=COLORS["surface"])
+            transcription = compilation.transcriptions.get(path, "")
+            summary_text = mock_summary(path, transcription)
+            self.summary_drafts[path] = summary_text
+
+        split_area = Frame(summary_card, background=COLORS["surface"])
+        split_area.pack(fill=BOTH, expand=True)
+        split_area.columnconfigure(0, weight=1, uniform="split")
+        split_area.columnconfigure(1, weight=1, uniform="split")
+        split_area.rowconfigure(0, weight=1)
+
+        # Left pane: Source File
+        left_pane = Frame(
+            split_area,
+            background=COLORS["surface"],
+            highlightbackground=COLORS["border"],
+            highlightthickness=1,
+            padx=10,
+            pady=8,
+        )
+        left_pane.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+
+        left_header = Frame(left_pane, background=COLORS["surface"])
+        left_header.pack(fill=X, pady=(0, 6))
+        Label(
+            left_header,
+            text="Source Text File",
+            font=("Segoe UI", 10, "bold"),
+            foreground=COLORS["text"],
+            background=COLORS["surface"],
+        ).pack(side=LEFT)
+        self._button(
+            left_header,
+            "Open file",
+            lambda selected=path: self._open_file(selected),
+            primary=True,
+            compact=True,
+        ).pack(side=RIGHT)
+
+        source_text_area = Frame(left_pane, background=COLORS["surface"])
+        source_text_area.pack(fill=BOTH, expand=True)
+        source_widget = Text(
+            source_text_area,
+            wrap="word",
+            font=("Segoe UI", 9),
+            foreground=COLORS["text"],
+            background="#F8F9FA",
+            relief="flat",
+            padx=10,
+            pady=8,
+        )
+        source_scroll = ttk.Scrollbar(
+            source_text_area, orient=VERTICAL, command=source_widget.yview
+        )
+        source_widget.configure(yscrollcommand=source_scroll.set)
+        source_widget.pack(side=LEFT, fill=BOTH, expand=True)
+        source_scroll.pack(side=RIGHT, fill=Y)
+        source_widget.insert("1.0", self._read_source_file_content(path))
+        source_widget.configure(state="disabled")
+
+        # Right pane: Generated Summary
+        right_pane = Frame(
+            split_area,
+            background=COLORS["surface"],
+            highlightbackground=COLORS["border"],
+            highlightthickness=1,
+            padx=10,
+            pady=8,
+        )
+        right_pane.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+
+        right_header = Frame(right_pane, background=COLORS["surface"])
+        right_header.pack(fill=X, pady=(0, 6))
+        Label(
+            right_header,
+            text="Generated Summary",
+            font=("Segoe UI", 10, "bold"),
+            foreground=COLORS["text"],
+            background=COLORS["surface"],
+        ).pack(side=LEFT)
+        self._button(
+            right_header,
+            "Regenerate",
+            lambda selected=path: self._generate_summary(selected),
+            primary=True,
+            compact=True,
+        ).pack(side=RIGHT)
+
+        summary_area = Frame(right_pane, background=COLORS["surface"])
         summary_area.pack(fill=BOTH, expand=True)
         summary_widget = Text(
             summary_area,
@@ -1360,8 +1822,8 @@ class SummaraizerApp:
             background="#FAFBFC",
             relief="solid",
             borderwidth=1,
-            padx=12,
-            pady=12,
+            padx=10,
+            pady=8,
         )
         summary_scroll = ttk.Scrollbar(
             summary_area, orient=VERTICAL, command=summary_widget.yview
@@ -1372,63 +1834,65 @@ class SummaraizerApp:
         summary_widget.insert("1.0", summary_text)
         self.summary_editor = summary_widget
         self.summary_editor_path = path
-        controls = Frame(content, background=COLORS["background"])
-        controls.pack(fill=X, pady=(12, 0))
-        self._button(
-            controls,
-            "Generate summary for file",
-            lambda selected=path: self._generate_summary(selected),
-            primary=True,
-        ).pack(side=RIGHT)
-        self._button(
-            controls,
-            "Save edits",
-            self._save_summary_edits,
-        ).pack(side=RIGHT, padx=(0, 8))
-        self._button(
-            controls,
-            "Previous",
-            lambda: self._select_summary_file(max(0, self.summary_index - 1)),
-        ).pack(side=LEFT)
-        self._button(
-            controls,
-            "Next",
-            lambda: self._select_summary_file(
-                min(len(files) - 1, self.summary_index + 1)
-            ),
-        ).pack(side=LEFT, padx=(8, 0))
 
-        footer = Frame(self.page_container, background=COLORS["background"])
-        footer.pack(fill=X, padx=34, pady=(0, 22))
+        # Controls right below the split screen:
+        controls = Frame(content, background=COLORS["background"])
+        controls.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        left_controls = Frame(controls, background=COLORS["background"])
+        left_controls.pack(side=LEFT)
+        right_controls = Frame(controls, background=COLORS["background"])
+        right_controls.pack(side=RIGHT)
+
+        has_next = self.summary_index < len(files) - 1
+        if has_next:
+            self._button(
+                right_controls,
+                "Next File",
+                self._next_summary_file,
+                primary=True,
+            ).pack(side=RIGHT)
+            self._button(
+                left_controls,
+                "Save",
+                self._save_summary_edits,
+            ).pack(side=LEFT, padx=(0, 8))
+        else:
+            self._button(
+                right_controls,
+                "Finalize",
+                self._finalize_summary,
+                primary=True,
+            ).pack(side=RIGHT)
+
         self._button(
-            footer,
+            left_controls,
             "Cancel",
             self._cancel_summary_edits,
         ).pack(side=LEFT)
-        if compilation.master_summary:
+
+        if self.summary_index > 0:
             self._button(
-                footer,
-                "View master summary",
-                self._show_master_summary,
+                right_controls,
+                "Previous",
+                self._previous_summary_file,
             ).pack(side=RIGHT, padx=(0, 8))
-            self._button(
-                footer,
-                "Export master summary",
-                self._export_master_summary,
-            ).pack(side=RIGHT)
-            Label(
-                footer,
-                text="Master summary finalized",
-                font=("Segoe UI", 9, "bold"),
-                foreground=COLORS["success"],
-                background=COLORS["background"],
-            ).pack(side=RIGHT, padx=(0, 12))
-        self._button(
-            footer,
-            "Finalize compilation",
-            self._finalize_summary,
-            primary=True,
-        ).pack(side=RIGHT, padx=(0, 10))
+
+    def _next_summary_file(self) -> None:
+        compilation = self._require_compilation()
+        if compilation is None:
+            return
+        self._stage_current_summary()
+        files = compilation.summary_files
+        if self.summary_index < len(files) - 1:
+            self._select_summary_file(self.summary_index + 1)
+
+    def _previous_summary_file(self) -> None:
+        compilation = self._require_compilation()
+        if compilation is None:
+            return
+        self._stage_current_summary()
+        if self.summary_index > 0:
+            self._select_summary_file(self.summary_index - 1)
 
     def _select_summary_file(self, index: int) -> None:
         compilation = self._require_compilation()
@@ -1483,26 +1947,10 @@ class SummaraizerApp:
         if compilation is None:
             return
         self._stage_current_summary()
-        missing = [
-            Path(path).name
-            for path in compilation.summary_files
-            if not self.summary_drafts.get(path, "").strip()
-        ]
-        if missing:
-            messagebox.showinfo(
-                "Summaries still needed",
-                "Generate an individual summary for each file before finalizing:\n"
-                + "\n".join(missing[:8])
-                + ("\n…" if len(missing) > 8 else ""),
-                parent=self.root,
-            )
-            first_missing = next(
-                index
-                for index, path in enumerate(compilation.summary_files)
-                if not self.summary_drafts.get(path, "").strip()
-            )
-            self._select_summary_file(first_missing)
-            return
+        for path in compilation.summary_files:
+            if not self.summary_drafts.get(path, "").strip():
+                transcription = compilation.transcriptions.get(path, "")
+                self.summary_drafts[path] = mock_summary(path, transcription)
         compilation.summaries = dict(self.summary_drafts)
         compilation.master_summary = aggregate_summaries(compilation)
         try:

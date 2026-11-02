@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from tkinter import Button, Text, Tk
+from tkinter import Button, Label, Text, Tk
 from unittest.mock import patch
 
 from summaraizer_app import (
@@ -142,6 +142,15 @@ class GuiIntuitionTests(unittest.TestCase):
                 res.extend(self._find_texts(child))
         return res
 
+    def _find_labels(self, widget: object) -> list[Label]:
+        res: list[Label] = []
+        if isinstance(widget, Label):
+            res.append(widget)
+        if hasattr(widget, "winfo_children"):
+            for child in widget.winfo_children():
+                res.extend(self._find_labels(child))
+        return res
+
     def test_drag_and_drop_on_viewer_page(self) -> None:
         self.app.show_page("viewer")
         doc_path = Path(self.temp_dir.name) / "doc1.txt"
@@ -178,13 +187,13 @@ class GuiIntuitionTests(unittest.TestCase):
         audio_path.write_text("audio bytes", encoding="utf-8")
         self.compilation.files.append(str(audio_path.resolve()))
 
-        # 4. Mock transcription generated upon opening without pressing generate
+        # Mock transcription generated upon opening without pressing generate
         self.app.show_page("transcription")
         resolved = str(audio_path.resolve())
         self.assertIn(resolved, self.app.transcription_drafts)
         self.assertTrue(len(self.app.transcription_drafts[resolved]) > 0)
 
-        # 5. Primary button is "Save Edits"
+        # Primary button is "Save Edits"
         buttons = self._find_buttons(self.app.page_container)
         save_edits_btns = [b for b in buttons if b.cget("text") == "Save Edits"]
         self.assertEqual(len(save_edits_btns), 1)
@@ -211,47 +220,95 @@ class GuiIntuitionTests(unittest.TestCase):
         f1.write_text("Content of file 1", encoding="utf-8")
         f2 = Path(self.temp_dir.name) / "file2.txt"
         f2.write_text("Content of file 2", encoding="utf-8")
-        self.compilation.files = [str(f1.resolve()), str(f2.resolve())]
+        f3 = Path(self.temp_dir.name) / "audio.mp3"
+        f3.write_text("audio data", encoding="utf-8")
+        self.compilation.files = [
+            str(f1.resolve()),
+            str(f2.resolve()),
+            str(f3.resolve()),
+        ]
 
-        # 4. Generate mock summaries upon opening
+        # Generate mock summaries upon opening
         self.app.show_page("summary")
         self.assertIn(str(f1.resolve()), self.app.summary_drafts)
         self.assertIn(str(f2.resolve()), self.app.summary_drafts)
 
-        # 3. Split-screen comparison format: source text and summary editor
+        # Split-screen comparison format: source text and summary editor
         texts = self._find_texts(self.app.page_container)
         self.assertGreaterEqual(len(texts), 2)
         text_contents = [t.get("1.0", "end-1c") for t in texts]
         self.assertTrue(any("Content of file 1" in c for c in text_contents))
 
-        # 6. Primary button is "Next File" when next file exists; Save button present
-        self.assertEqual(self.app.summary_index, 0)
+        # Cancel button is present on summary generation screen
         buttons = self._find_buttons(self.app.page_container)
         btn_texts = [b.cget("text") for b in buttons]
+        self.assertIn("Cancel", btn_texts)
+
+        # Primary button is "Next File" when next file exists; Save button present
+        self.assertEqual(self.app.summary_index, 0)
         self.assertIn("Next File", btn_texts)
         self.assertIn("Save", btn_texts)
         self.assertNotIn("Finalize", btn_texts)
         next_btn = next(b for b in buttons if b.cget("text") == "Next File")
         self.assertEqual(next_btn.cget("background"), COLORS["accent"])
+        self.assertEqual(int(next_btn.cget("padx")), 16)
+        self.assertEqual(int(next_btn.cget("pady")), 10)
+        for action_text in ("Open file", "Regenerate"):
+            action_btn = next(b for b in buttons if b.cget("text") == action_text)
+            self.assertEqual(action_btn.cget("background"), COLORS["accent"])
+            self.assertEqual(int(action_btn.cget("padx")), 10)
+            self.assertEqual(int(action_btn.cget("pady")), 6)
+        self.assertNotIn("Reset to mock", btn_texts)
+        save_btn = next(b for b in buttons if b.cget("text") == "Save")
+        cancel_btn = next(b for b in buttons if b.cget("text") == "Cancel")
+        self.assertEqual(save_btn.master, cancel_btn.master)
+        self.assertEqual(save_btn.master.pack_info()["side"], "left")
+        self.assertEqual(next_btn.master.pack_info()["side"], "right")
 
         # Click Next File
         self.app._next_summary_file()
         self.assertEqual(self.app.summary_index, 1)
 
-        # 7. Last file: remove "save" button, turn next file into "Finalize" button
+        # Last file: remove "save" button, turn next file into "Finalize" button
         buttons2 = self._find_buttons(self.app.page_container)
         btn_texts2 = [b.cget("text") for b in buttons2]
         self.assertIn("Finalize", btn_texts2)
         self.assertNotIn("Save", btn_texts2)
         self.assertNotIn("Next File", btn_texts2)
+        self.assertIn("Cancel", btn_texts2)
+        previous_btn = next(b for b in buttons2 if b.cget("text") == "Previous")
         finalize_btn = next(b for b in buttons2 if b.cget("text") == "Finalize")
+        self.assertEqual(previous_btn.master, finalize_btn.master)
+        self.assertEqual(previous_btn.master.pack_info()["side"], "right")
         self.assertEqual(finalize_btn.cget("background"), COLORS["accent"])
+        self.assertEqual(int(finalize_btn.cget("padx")), 16)
+        self.assertEqual(int(finalize_btn.cget("pady")), 10)
 
         # Finalize compilation
         self.app._finalize_summary()
         self.assertNotEqual(self.compilation.master_summary, "")
         self.assertEqual(self.app.active_page, "viewer")
 
+        # Once summary is finalized, buttons should still be visible:
+        # Deep Dive is primary, Transcript viewing and Summary Generation still available
+        viewer_buttons = self._find_buttons(self.app.page_container)
+        viewer_map = {b.cget("text"): b for b in viewer_buttons}
+        self.assertIn("Deep Dive", viewer_map)
+        self.assertEqual(viewer_map["Deep Dive"].cget("background"), COLORS["accent"])
+        self.assertIn("Summary Generation", viewer_map)
+        self.assertIn("Transcript viewing", viewer_map)
+
+        # A finalized summary should not add duplicate footer actions or status.
+        self.app.show_page("summary")
+        finalized_buttons = self._find_buttons(self.app.page_container)
+        finalized_texts = [b.cget("text") for b in finalized_buttons]
+        self.assertEqual(finalized_texts.count("Cancel"), 1)
+        self.assertNotIn("View master summary", finalized_texts)
+        self.assertNotIn("Export master summary", finalized_texts)
+        finalized_labels = [
+            label.cget("text") for label in self._find_labels(self.app.page_container)
+        ]
+        self.assertNotIn("Master summary finalized", finalized_labels)
 
 if __name__ == "__main__":
     unittest.main()
