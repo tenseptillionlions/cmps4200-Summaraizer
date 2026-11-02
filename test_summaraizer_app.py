@@ -310,6 +310,5 @@ class GuiIntuitionTests(unittest.TestCase):
         ]
         self.assertNotIn("Master summary finalized", finalized_labels)
 
-
 if __name__ == "__main__":
     unittest.main()
