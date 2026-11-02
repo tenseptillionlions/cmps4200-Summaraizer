@@ -23,10 +23,21 @@ file paths, sample transcriptions, and summaries are saved locally in
 
 Supported input file extensions match the design: `.txt` and `.pdf` documents,
 plus `.mp3` and `.wav` audio. Files are referenced in place rather than copied.
-Adding audio opens transcription automatically. Saving a transcript writes a
-sibling file such as `recording-transcript.txt`; Cancel discards unsaved
-transcription changes. Only `.txt` and `.pdf` files, including saved
-transcripts, appear in summary generation. Summaries follow filename order and
-can be edited, saved, or discarded before finalizing. Transcription filenames
+Files can be added via the "+ Add files" button or by dragging and dropping them
+directly into the compilation viewer page. Files and finalized summaries can be
+opened directly from the compilation viewer or double-clicked to view.
+
+Adding audio opens transcription automatically with sample transcripts generated
+immediately on open. Transcripts are directly editable, and the primary action
+is "Save Edits", which writes a sibling file such as `recording-transcript.txt`;
+Cancel discards unsaved transcription changes.
+
+Only `.txt` and `.pdf` files, including saved transcripts, appear in summary
+generation. Mockup summaries are generated automatically upon opening rather than
+waiting for a generate command. During summary review, a split-screen format
+allows comparing the source document with the generated summary side by side.
+The primary button advances with "Next File"; when reaching the final file in the
+compilation, the "Save" button is removed and the primary button turns into
+"Finalize" to aggregate and complete the compilation summary. Transcription filenames
 containing `silent`, `empty`, or `no-speech` show the no-speech state; names
 containing `unclear`, `noise`, or `low-confidence` show a low-confidence sample.
