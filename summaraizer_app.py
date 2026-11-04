@@ -20,18 +20,19 @@ from tkinter import (
     VERTICAL,
     X,
     Y,
-    Button,
     Entry,
     Frame,
     Label,
     Text,
     Tk,
+    TclError,
     Toplevel,
     filedialog,
     messagebox,
-    ttk,
 )
 from typing import Callable
+
+from mock_ai import mock_summary, mock_transcription
 
 
 APP_NAME = "Summaraizer"
@@ -42,17 +43,18 @@ AUDIO_TYPES = {".mp3": "Audio", ".wav": "Audio"}
 SUPPORTED_TYPES = {**DOCUMENT_TYPES, **AUDIO_TYPES}
 
 COLORS = {
-    "background": "#F9FAFB",
+    "background": "#F8FAFC",
     "surface": "#FFFFFF",
     "sidebar": "#17212B",
     "sidebar_muted": "#AAB5C0",
     "text": "#0F172A",
-    "body": "#334155",
+    "body": "#475569",
     "muted": "#64748B",
     "border": "#E2E8F0",
-    "accent": "#3B82F6",
-    "accent_hover": "#2563EB",
-    "accent_light": "#EEF2FF",
+    "accent": "#2563EB",
+    "accent_hover": "#1D4ED8",
+    "accent_light": "#EFF6FF",
+    "sidebar_active": "#2A3A4B",
     "success": "#10B981",
     "success_hover": "#059669",
     "success_light": "#ECFDF5",
@@ -164,53 +166,16 @@ def classify_file(path: str | Path) -> str | None:
     return SUPPORTED_TYPES.get(Path(path).suffix.lower())
 
 
+def display_filename(path: str | Path, limit: int = 42) -> str:
+    name = Path(path).name
+    if len(name) <= limit:
+        return name
+    return f"{name[: limit // 2 - 2]}...{name[-(limit // 2 - 1):]}"
+
+
 def transcript_path_for(audio_path: str | Path) -> Path:
     audio = Path(audio_path)
     return audio.with_name(f"{audio.stem}-transcript.txt")
-
-
-def mock_transcription(path: str | Path) -> tuple[str, bool]:
-    name = Path(path).stem
-    lowered_name = name.lower()
-    if any(term in lowered_name for term in ("silent", "empty", "no-speech")):
-        return (
-            "No speech could be detected in this recording. Check the audio file "
-            "and try again.",
-            True,
-        )
-    if any(term in lowered_name for term in ("unclear", "noise", "low-confidence")):
-        return (
-            f"[Low confidence] A short sample transcript was generated for "
-            f"“{name}”. Background noise or unclear speech may affect accuracy.",
-            True,
-        )
-    paragraph = (
-        f"[0:00]Sample transcription for “{name}”.\n"
-        "[0:30] This also demonstrates the timestamps.\n"
-        "[1:00] I am taking very long pauses. That is why the timestamps are like this.\n"
-        "[1:30]Good result."
-    )
-    return "\n\n".join(paragraph for _ in range(10)), False
-
-
-def mock_summary(path: str | Path, transcription: str = "") -> str:
-    name = Path(path).stem
-    if transcription.startswith("No speech could be detected"):
-        detail = "No speech was detected, so this file has no transcript to summarize."
-    elif transcription.startswith("[Low confidence]"):
-        detail = (
-            "A sample transcript was available, but its low confidence means "
-            "details should be verified against the recording."
-        )
-    elif name.casefold() == "classnotes":
-        detail = "A summary of notes for the class."
-    elif name.casefold().endswith("-transcript"):
-        detail = (
-            "Summary of the audio transcription. \n"
-        )
-    else:
-        detail = f"Sample summary for {name}."
-    return f"{name}: {detail} (Sample summary — AI is not connected.)"
 
 
 def aggregate_summaries(compilation: Compilation) -> str:
@@ -228,13 +193,20 @@ def aggregate_summaries(compilation: Compilation) -> str:
 
 
 class ScrollableFrame(Frame):
-    def __init__(self, master: Frame, **kwargs: object) -> None:
+    def __init__(
+        self, master: Frame, *, background: str = COLORS["background"], **kwargs: object
+    ) -> None:
         super().__init__(master, **kwargs)
         self.canvas = Canvas(
-            self, highlightthickness=0, background=COLORS["background"]
+            self, highlightthickness=0, background=background
         )
-        self.scrollbar = ttk.Scrollbar(self, orient=VERTICAL, command=self.canvas.yview)
-        self.content = Frame(self.canvas, background=COLORS["background"])
+        self.scrollbar = AutoHideScrollbar(
+            self,
+            orient=VERTICAL,
+            command=self.canvas.yview,
+            dark=background == COLORS["sidebar"],
+        )
+        self.content = Frame(self.canvas, background=background)
         self.window_id = self.canvas.create_window(
             (0, 0), window=self.content, anchor="nw"
         )
@@ -243,20 +215,70 @@ class ScrollableFrame(Frame):
         self.scrollbar.pack(side=RIGHT, fill=Y)
         self.content.bind(
             "<Configure>",
-            lambda _event: self.canvas.configure(
-                scrollregion=self.canvas.bbox("all")
-            ),
+            self._update_scroll_region,
         )
         self.canvas.bind(
             "<Configure>",
-            lambda event: self.canvas.itemconfigure(self.window_id, width=event.width),
+            self._on_canvas_configure,
         )
-        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+
+    def _update_scroll_region(self, _event: object = None) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event: object) -> None:
+        self.canvas.itemconfigure(
+            self.window_id, width=getattr(event, "width", self.canvas.winfo_width())
+        )
+        self._update_scroll_region()
 
     def _on_mousewheel(self, event: object) -> None:
+        widget = getattr(event, "widget", None)
+        inside_content = False
+        while widget is not None:
+            if widget is self.content:
+                inside_content = True
+                break
+            widget = getattr(widget, "master", None)
+
+        if not inside_content and getattr(event, "widget", None) not in (
+            self.canvas,
+            self.scrollbar,
+        ):
+            return
+
         delta = getattr(event, "delta", 0)
         if delta:
-            self.canvas.yview_scroll(int(-delta / 120), "units")
+            units = int(-delta / 120) or (-1 if delta > 0 else 1)
+            self.canvas.yview_scroll(units, "units")
+
+
+class AutoHideScrollbar(ctk.CTkScrollbar):
+    def __init__(
+        self,
+        master: Frame,
+        *,
+        orient: str = VERTICAL,
+        command: Callable[..., None],
+        dark: bool = False,
+    ) -> None:
+        super().__init__(
+            master,
+            orientation="vertical" if orient == VERTICAL else "horizontal",
+            command=command,
+            width=9,
+            fg_color=COLORS["sidebar"] if dark else "#F1F5F9",
+            button_color="#475569" if dark else "#CBD5E1",
+            button_hover_color="#64748B" if dark else "#94A3B8",
+        )
+
+    def set(self, first: str, last: str) -> None:
+        if float(first) <= 0 and float(last) >= 1:
+            if self.winfo_manager():
+                self.pack_forget()
+        elif not self.winfo_manager():
+            self.pack(side=RIGHT, fill=Y)
+        super().set(first, last)
 
 
 class TranscriptTextbox(ctk.CTkTextbox):
@@ -291,113 +313,152 @@ class SummaraizerApp:
         self.audio_duration_seconds = 0.0
         self.audio_position_after: str | None = None
         self.transcription_drafts: dict[str, str] = {}
-        self._c_wnd_proc: object | None = None
-        self._old_wnd_proc: object | None = None
-        self.chat_entry: Entry | None = None
+        self._drop_window_procs: dict[int, tuple[int, object]] = {}
+        self.chat_entry: ctk.CTkTextbox | None = None
         self.chat_messages: list[tuple[str, str]] = []
         self.retryable_chat_responses: set[int] = set()
-        self.page_container: Frame
-        self.page_title: Label
+        self.page_container: ctk.CTkFrame
+        self.sidebar_nav: ctk.CTkFrame
+        self.sidebar_compilations: ScrollableFrame
+        self.drag_drop_enabled = False
         self.empty_state_icon: ctk.CTkImage | None = None
 
-        self._configure_styles()
         self.root.title(APP_NAME)
-        self.root.geometry("1180x760")
-        self.root.minsize(940, 620)
+        self.root.geometry("1280x820")
+        self.root.minsize(1024, 700)
         self.root.configure(background=COLORS["background"])
         self._build_shell()
         self._setup_drag_and_drop()
+        if self.drag_drop_enabled:
+            self.root.bind("<Map>", self._schedule_drop_targets, add="+")
         self.show_page("home")
 
-    def _configure_styles(self) -> None:
-        style = ttk.Style(self.root)
-        style.theme_use("clam")
-        style.configure(
-            "TScrollbar",
-            background=COLORS["background"],
-            troughcolor=COLORS["background"],
-            bordercolor=COLORS["background"],
-            arrowcolor=COLORS["muted"],
-        )
-        style.configure(
-            "TProgressbar",
-            background=COLORS["accent"],
-            troughcolor=COLORS["border"],
-            bordercolor=COLORS["border"],
-        )
-
     def _build_shell(self) -> None:
-        shell = Frame(self.root, background=COLORS["background"])
+        shell = ctk.CTkFrame(
+            self.root, fg_color=COLORS["background"], corner_radius=0
+        )
         shell.pack(fill=BOTH, expand=True)
-        main = Frame(shell, background=COLORS["background"])
-        main.pack(fill=BOTH, expand=True)
-        topbar = Frame(
-            main,
-            background=COLORS["surface"],
-            highlightbackground=COLORS["border"],
-            highlightthickness=1,
+        sidebar = ctk.CTkFrame(
+            shell,
+            width=216,
+            fg_color=COLORS["sidebar"],
+            corner_radius=0,
         )
-        topbar.pack(fill=X)
-        self.page_title = Label(
-            topbar,
-            text="Home",
-            font=("Segoe UI", 16, "bold"),
-            foreground=COLORS["text"],
-            background=COLORS["surface"],
-            padx=28,
-            pady=19,
+        sidebar.pack(side=LEFT, fill=Y)
+        sidebar.pack_propagate(False)
+        ctk.CTkLabel(
+            sidebar,
+            text="SUMMARAIZER",
+            font=("Segoe UI", 15, "bold"),
+            text_color="#FFFFFF",
+            anchor="w",
+        ).pack(fill=X, padx=20, pady=(24, 20))
+        self._button(
+            sidebar,
+            "+  New compilation",
+            self._open_create_dialog,
+            primary=True,
+        ).pack(fill=X, padx=14, pady=(0, 20))
+
+        self.sidebar_nav = ctk.CTkFrame(sidebar, fg_color="transparent")
+        self.sidebar_nav.pack(fill=X, padx=10)
+        ctk.CTkLabel(
+            sidebar,
+            text="COMPILATIONS",
+            font=("Segoe UI", 10, "bold"),
+            text_color=COLORS["sidebar_muted"],
+            anchor="w",
+        ).pack(fill=X, padx=20, pady=(22, 8))
+        self.sidebar_compilations = ScrollableFrame(
+            sidebar,
+            background=COLORS["sidebar"],
+            borderwidth=0,
+            highlightthickness=0,
         )
-        self.page_title.grid(row=0, column=0, sticky="w")
-        self.active_name = Label(
-            topbar,
-            text="No compilation selected",
+        self.sidebar_compilations.pack(
+            fill=BOTH, expand=True, padx=10, pady=(0, 8)
+        )
+        ctk.CTkLabel(
+            sidebar,
+            text="Saved on this device",
             font=("Segoe UI", 9),
-            foreground=COLORS["muted"],
-            background=COLORS["surface"],
-            padx=24,
+            text_color=COLORS["sidebar_muted"],
+            anchor="w",
+        ).pack(side="bottom", fill=X, padx=20, pady=18)
+
+        main = ctk.CTkFrame(shell, fg_color=COLORS["background"], corner_radius=0)
+        main.pack(side=LEFT, fill=BOTH, expand=True)
+        self.page_container = ctk.CTkFrame(
+            main, fg_color=COLORS["background"], corner_radius=0
         )
-        self.active_name.grid(row=0, column=1, sticky="e")
-        topbar.columnconfigure(0, weight=1)
-        self.page_container = Frame(main, background=COLORS["background"])
         self.page_container.pack(fill=BOTH, expand=True)
+        self._refresh_sidebar()
+
+    def _refresh_sidebar(self) -> None:
+        for child in self.sidebar_nav.winfo_children():
+            child.destroy()
+        for child in self.sidebar_compilations.content.winfo_children():
+            child.destroy()
+        pages = [
+            ("Home", "home"),
+            ("Files", "viewer"),
+            ("Transcription", "transcription"),
+            ("Summary", "summary"),
+            ("Deep Dive", "chat"),
+        ]
+        for label, page in pages:
+            available = page == "home" or self.active_compilation is not None
+            active = self.active_page == page
+            button = ctk.CTkButton(
+                self.sidebar_nav,
+                text=label,
+                command=lambda selected=page: self.show_page(selected),
+                height=40,
+                corner_radius=8,
+                anchor="w",
+                font=("Segoe UI", 12, "bold" if active else "normal"),
+                fg_color=COLORS["sidebar_active"] if active else "transparent",
+                hover_color="#34495D",
+                text_color="#FFFFFF" if available else COLORS["sidebar_muted"],
+                state="normal" if available else "disabled",
+            )
+            button.pack(fill=X, pady=2)
+
+        for compilation in reversed(self.compilations):
+            active = self.active_compilation is compilation
+            name = compilation.name
+            if len(name) > 16:
+                name = f"{name[:13]}..."
+            button = ctk.CTkButton(
+                self.sidebar_compilations.content,
+                text=f"{name}  ·  {len(compilation.files)}",
+                command=lambda selected=compilation: self._open_compilation(selected),
+                height=38,
+                corner_radius=8,
+                anchor="w",
+                font=("Segoe UI", 11, "bold" if active else "normal"),
+                fg_color=COLORS["sidebar_active"] if active else "transparent",
+                hover_color="#34495D",
+                text_color="#FFFFFF",
+            )
+            button.pack(fill=X, pady=2)
 
     def _setup_drag_and_drop(self) -> None:
-        try:
-            import windnd  # type: ignore
-
-            windnd.hook_dropfiles(self.root, func=self._on_windnd_drop)
-            return
-        except Exception:
-            pass
-
         if sys.platform == "win32":
             try:
                 self._setup_native_drag_drop()
-            except Exception:
-                pass
-
-    def _on_windnd_drop(self, files: list[bytes | str]) -> None:
-        decoded: list[str] = [
-            f.decode("utf-8", errors="replace") if isinstance(f, bytes) else str(f)
-            for f in files
-        ]
-        self._on_files_dropped(decoded)
+                self.drag_drop_enabled = True
+                self._schedule_drop_targets()
+            except (AttributeError, OSError) as error:
+                self.drag_drop_enabled = False
+                print(f"File drag and drop could not be enabled: {error}", file=sys.stderr)
 
     def _setup_native_drag_drop(self) -> None:
         import ctypes
         from ctypes import wintypes
 
-        user32 = ctypes.windll.user32
-        shell32 = ctypes.windll.shell32
-
-        try:
-            self.root.update_idletasks()
-            hwnd = self.root.winfo_id()
-            if not hwnd:
-                return
-            shell32.DragAcceptFiles(hwnd, True)
-        except Exception:
-            return
+        self._user32 = ctypes.windll.user32
+        self._shell32 = ctypes.windll.shell32
 
         WNDPROC = ctypes.WINFUNCTYPE(
             ctypes.c_ssize_t,
@@ -406,69 +467,114 @@ class SummaraizerApp:
             wintypes.WPARAM,
             wintypes.LPARAM,
         )
-        GWLP_WNDPROC = -4
-        WM_DROPFILES = 0x0233
-
-        SetWindowLongPtr = getattr(
-            user32, "SetWindowLongPtrW", getattr(user32, "SetWindowLongW", None)
+        self._WNDPROC = WNDPROC
+        self._GWLP_WNDPROC = -4
+        self._WM_DROPFILES = 0x0233
+        self._set_window_long_ptr = getattr(
+            self._user32,
+            "SetWindowLongPtrW",
+            getattr(self._user32, "SetWindowLongW", None),
         )
-        if not SetWindowLongPtr:
-            return
-        SetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
-        SetWindowLongPtr.restype = ctypes.c_void_p
-
-        CallWindowProc = user32.CallWindowProcW
-        CallWindowProc.argtypes = [
+        if not self._set_window_long_ptr:
+            raise OSError("SetWindowLongPtr is unavailable")
+        self._set_window_long_ptr.argtypes = [
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        self._set_window_long_ptr.restype = ctypes.c_void_p
+        self._call_window_proc = self._user32.CallWindowProcW
+        self._call_window_proc.argtypes = [
             ctypes.c_void_p,
             wintypes.HWND,
             wintypes.UINT,
             wintypes.WPARAM,
             wintypes.LPARAM,
         ]
-        CallWindowProc.restype = ctypes.c_ssize_t
-
-        shell32.DragQueryFileW.argtypes = [
+        self._call_window_proc.restype = ctypes.c_ssize_t
+        self._shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+        self._shell32.DragAcceptFiles.restype = None
+        self._shell32.DragQueryFileW.argtypes = [
             wintypes.WPARAM,
             wintypes.UINT,
             wintypes.LPWSTR,
             wintypes.UINT,
         ]
-        shell32.DragQueryFileW.restype = wintypes.UINT
-        shell32.DragFinish.argtypes = [wintypes.WPARAM]
-        shell32.DragFinish.restype = None
+        self._shell32.DragQueryFileW.restype = wintypes.UINT
+        self._shell32.DragFinish.argtypes = [wintypes.WPARAM]
+        self._shell32.DragFinish.restype = None
+        self.root.bind("<Destroy>", lambda _e: self._restore_drop_targets(), add="+")
 
-        def wnd_proc(hWnd: int, msg: int, wParam: int, lParam: int) -> int:
-            if msg == WM_DROPFILES:
-                hdrop = wParam
-                try:
-                    count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
-                    dropped: list[str] = []
-                    for i in range(count):
-                        length = shell32.DragQueryFileW(hdrop, i, None, 0)
-                        buf = ctypes.create_unicode_buffer(length + 1)
-                        shell32.DragQueryFileW(hdrop, i, buf, length + 1)
-                        dropped.append(buf.value)
-                    shell32.DragFinish(hdrop)
-                    self.root.after(0, lambda: self._on_files_dropped(dropped))
-                except Exception:
-                    pass
-                return 0
-            return CallWindowProc(old_wnd_proc, hWnd, msg, wParam, lParam)
-
-        self._c_wnd_proc = WNDPROC(wnd_proc)
-        old_wnd_proc = SetWindowLongPtr(
-            hwnd, GWLP_WNDPROC, ctypes.cast(self._c_wnd_proc, ctypes.c_void_p)
-        )
-        self._old_wnd_proc = old_wnd_proc
-
-        def cleanup() -> None:
+    def _register_drop_targets(self) -> None:
+        if not self.drag_drop_enabled or not hasattr(self, "_WNDPROC"):
+            return
+        if not self.root.winfo_viewable():
+            return
+        self.root.update_idletasks()
+        widgets = [self.root]
+        while widgets:
+            widget = widgets.pop()
             try:
-                if self._old_wnd_proc and SetWindowLongPtr:
-                    SetWindowLongPtr(hwnd, GWLP_WNDPROC, self._old_wnd_proc)
-            except Exception:
-                pass
+                hwnd = int(widget.winfo_id())
+                if hwnd and hwnd not in self._drop_window_procs:
+                    self._hook_drop_window(hwnd)
+                widgets.extend(widget.winfo_children())
+            except (AttributeError, OSError, TclError):
+                continue
 
-        self.root.bind("<Destroy>", lambda _e: cleanup(), add="+")
+    def _schedule_drop_targets(self, _event: object = None) -> None:
+        if self.drag_drop_enabled and self.root.winfo_viewable():
+            self.root.after_idle(self._register_drop_targets)
+
+    def _hook_drop_window(self, hwnd: int) -> None:
+        import ctypes
+
+        self._shell32.DragAcceptFiles(hwnd, True)
+
+        def wnd_proc(h_wnd: int, msg: int, w_param: int, l_param: int) -> int:
+            if msg == self._WM_DROPFILES:
+                paths: list[str] = []
+                try:
+                    count = self._shell32.DragQueryFileW(w_param, 0xFFFFFFFF, None, 0)
+                    for index in range(count):
+                        length = self._shell32.DragQueryFileW(
+                            w_param, index, None, 0
+                        )
+                        buffer = ctypes.create_unicode_buffer(length + 1)
+                        self._shell32.DragQueryFileW(
+                            w_param, index, buffer, length + 1
+                        )
+                        paths.append(buffer.value)
+                finally:
+                    self._shell32.DragFinish(w_param)
+                self.root.after(0, lambda: self._on_files_dropped(paths))
+                return 0
+            return self._call_window_proc(
+                old_window_proc, h_wnd, msg, w_param, l_param
+            )
+
+        callback = self._WNDPROC(wnd_proc)
+        old_window_proc = self._set_window_long_ptr(
+            hwnd,
+            self._GWLP_WNDPROC,
+            ctypes.cast(callback, ctypes.c_void_p),
+        )
+        if not old_window_proc:
+            raise OSError(f"Could not register file drop target for window {hwnd}")
+        self._drop_window_procs[hwnd] = (old_window_proc, callback)
+
+    def _restore_drop_targets(self) -> None:
+        if not self._drop_window_procs:
+            return
+        for hwnd, (old_window_proc, _callback) in self._drop_window_procs.items():
+            try:
+                self._set_window_long_ptr(
+                    hwnd, self._GWLP_WNDPROC, old_window_proc
+                )
+                self._shell32.DragAcceptFiles(hwnd, False)
+            except (AttributeError, OSError):
+                continue
+        self._drop_window_procs.clear()
 
     def _on_files_dropped(self, files: list[str]) -> None:
         if self.active_page != "viewer" or self.active_compilation is None:
@@ -480,7 +586,6 @@ class SummaraizerApp:
 
     def _set_active(self, compilation: Compilation) -> None:
         self.active_compilation = compilation
-        self.active_name.configure(text=compilation.name)
 
     def _require_compilation(self) -> Compilation | None:
         if self.active_compilation is None:
@@ -505,6 +610,8 @@ class SummaraizerApp:
         if self.audio_position_after is not None:
             self.root.after_cancel(self.audio_position_after)
             self.audio_position_after = None
+        if self.drag_drop_enabled:
+            self._restore_drop_targets()
         self.summary_streaming_path = None
         if page == "summary":
             compilation = self.active_compilation
@@ -535,14 +642,6 @@ class SummaraizerApp:
         self.active_page = page
         for child in self.page_container.winfo_children():
             child.destroy()
-        titles = {
-            "home": "Home",
-            "viewer": "Compilation viewer",
-            "transcription": "Audio Transcriptions",
-            "summary": "Summary generation",
-            "chat": "Deep Dive",
-        }
-        self.page_title.configure(text=titles[page])
         renderers: dict[str, Callable[[], None]] = {
             "home": self._render_home,
             "viewer": self._render_viewer,
@@ -551,23 +650,28 @@ class SummaraizerApp:
             "chat": self._render_chat,
         }
         renderers[page]()
+        self._refresh_sidebar()
+        if self.drag_drop_enabled:
+            self._schedule_drop_targets()
 
-    def _page_intro(self, title: str, subtitle: str) -> Frame:
-        intro = Frame(self.page_container, background=COLORS["background"])
-        intro.pack(fill=X, padx=34, pady=(28, 20))
-        Label(
+    def _page_intro(self, title: str, subtitle: str) -> ctk.CTkFrame:
+        intro = ctk.CTkFrame(
+            self.page_container, fg_color=COLORS["background"], corner_radius=0
+        )
+        intro.pack(fill=X, padx=24, pady=(24, 18))
+        ctk.CTkLabel(
             intro,
             text=title,
-            font=("Segoe UI", 22, "bold"),
-            foreground=COLORS["text"],
-            background=COLORS["background"],
+            font=("Segoe UI", 23, "bold"),
+            text_color=COLORS["text"],
+            anchor="w",
         ).pack(anchor="w")
-        Label(
+        ctk.CTkLabel(
             intro,
             text=subtitle,
-            font=("Segoe UI", 10),
-            foreground=COLORS["muted"],
-            background=COLORS["background"],
+            font=("Segoe UI", 11),
+            text_color=COLORS["muted"],
+            anchor="w",
         ).pack(anchor="w", pady=(5, 0))
         return intro
 
@@ -584,39 +688,37 @@ class SummaraizerApp:
         padx: int | None = None,
         pady: int | None = None,
         font_size: int | None = None,
-    ) -> Button:
+    ) -> ctk.CTkButton:
         if padx is None:
             padx = 22 if large else (10 if compact else 16)
         if pady is None:
             pady = 12 if large else (6 if compact else 10)
         if font_size is None:
-            font_size = 11 if large else (8 if compact else 9)
-        button = Button(
+            font_size = 13 if large else (9 if compact else 10)
+        height = 56 if large else 2 * pady + 24
+        width = max(70, min(280, round(len(text) * font_size * 0.62 + 2 * padx)))
+        fg_color = (
+            COLORS["success"] if success else
+            COLORS["accent"] if primary else COLORS["surface"]
+        )
+        hover_color = (
+            COLORS["success_hover"] if success else
+            COLORS["accent_hover"] if primary else COLORS["accent_light"]
+        )
+        button = ctk.CTkButton(
             parent,
             text=text,
             command=command,
-            font=(
-                "Segoe UI",
-                font_size,
-                "bold" if (primary or success or large) else "normal",
-            ),
-            relief="flat",
-            borderwidth=0,
-            padx=padx,
-            pady=pady,
+            font=("Segoe UI", font_size, "bold" if (primary or success or large) else "normal"),
+            width=max(width, 300 if large else 0),
+            height=height,
+            corner_radius=8,
+            border_width=0 if primary or success else 1,
+            border_color=COLORS["border"],
+            fg_color=fg_color,
+            text_color="#FFFFFF" if (primary or success) else COLORS["text"],
+            hover_color=hover_color,
             cursor="hand2",
-            background=(
-                COLORS["success"] if success else
-                COLORS["accent"] if primary else COLORS["surface"]
-            ),
-            foreground="#FFFFFF" if (primary or success) else COLORS["text"],
-            activebackground=(
-                COLORS["success_hover"] if success else
-                COLORS["accent_hover"] if primary else COLORS["accent_light"]
-            ),
-            activeforeground="#FFFFFF" if (primary or success) else COLORS["text"],
-            highlightbackground=COLORS["border"],
-            highlightthickness=0 if primary else 1,
         )
         return button
 
@@ -644,7 +746,7 @@ class SummaraizerApp:
         intro.pack_configure(fill=X)
 
         summary = Frame(self.page_container, background=COLORS["background"])
-        summary.pack(fill=X, padx=34, pady=(0, 14))
+        summary.pack(fill=X, padx=24, pady=(0, 14))
         Label(
             summary,
             text=f"{len(self.compilations)} compilation"
@@ -656,20 +758,20 @@ class SummaraizerApp:
         Label(
             summary,
             text="Saved on this device",
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 10),
             foreground=COLORS["muted"],
             background=COLORS["background"],
         ).pack(side=RIGHT)
 
         if not self.compilations:
             empty = self._card(self.page_container)
-            empty.pack(fill=X, padx=34, pady=4)
+            empty.pack(fill=X, padx=24, pady=4)
             empty_content = Frame(
                 empty, background=COLORS["surface"], padx=28, pady=24
             )
             empty_content.pack(fill=X)
             empty_content.pack_propagate(False)
-            empty_content.configure(height=238)
+            empty_content.configure(height=300)
             empty_content.grid_columnconfigure(0, weight=1)
             icon_art = Image.new("RGBA", (72, 72), (0, 0, 0, 0))
             icon_draw = ImageDraw.Draw(icon_art)
@@ -694,7 +796,7 @@ class SummaraizerApp:
             Label(
                 empty_content,
                 text="Welcome to Summaraizer",
-                font=("Segoe UI", 18, "bold"),
+                font=("Segoe UI", 20, "bold"),
                 foreground=COLORS["text"],
                 background=COLORS["surface"],
             ).pack(anchor="center")
@@ -704,7 +806,7 @@ class SummaraizerApp:
                     "This application uses AI to compile and summarize information "
                     "from text and audio files. To begin, create a new compilation."
                 ),
-                font=("Segoe UI", 10),
+                font=("Segoe UI", 11),
                 foreground=COLORS["body"],
                 background=COLORS["surface"],
                 justify="center",
@@ -716,11 +818,12 @@ class SummaraizerApp:
                 self._open_create_dialog,
                 primary=True,
                 large=True,
+                font_size=14,
             ).pack(anchor="center")
             return
 
         collection = ScrollableFrame(self.page_container)
-        collection.pack(fill=BOTH, expand=True, padx=34, pady=(0, 24))
+        collection.pack(fill=BOTH, expand=True, padx=24, pady=(0, 20))
         for compilation in reversed(self.compilations):
             card = self._card(collection.content)
             card.pack(fill=X, pady=(0, 12))
@@ -867,7 +970,6 @@ class SummaraizerApp:
         self._persist()
         if self.active_compilation is compilation:
             self.active_compilation = None
-            self.active_name.configure(text="No compilation selected")
             self.summary_drafts.clear()
             self.transcription_drafts.clear()
             self.chat_messages.clear()
@@ -1084,7 +1186,9 @@ class SummaraizerApp:
             padx=12,
             pady=12,
         )
-        scrollbar = ttk.Scrollbar(text_area, orient=VERTICAL, command=preview.yview)
+        scrollbar = AutoHideScrollbar(
+            text_area, orient=VERTICAL, command=preview.yview
+        )
         preview.configure(yscrollcommand=scrollbar.set)
         preview.pack(side=LEFT, fill=BOTH, expand=True)
         scrollbar.pack(side=RIGHT, fill=Y)
@@ -1113,53 +1217,28 @@ class SummaraizerApp:
             intro, "+  Add files", self._choose_files, primary=True
         ).pack(side=RIGHT, anchor="e")
 
-        # Bottom actions bar packed with side="bottom" first so it is always visible!
-        actions = Frame(self.page_container, background=COLORS["background"])
-        actions.pack(side="bottom", fill=X, padx=34, pady=(10, 20))
-        self._button(
-            actions, "Return to Home", lambda: self.show_page("home")
-        ).pack(side=LEFT)
+        actions = ctk.CTkFrame(
+            self.page_container, fg_color=COLORS["background"], corner_radius=0
+        )
+        actions.pack(side="bottom", fill=X, padx=24, pady=(8, 16))
 
         has_transcripts = bool(compilation.audio_files) or any(
             f.endswith("-transcript.txt") for f in compilation.files
         )
 
         if compilation.master_summary:
-            # Summary is finalized: Deep Dive becomes the primary button
             self._button(
                 actions,
                 "Deep Dive",
                 lambda: self.show_page("chat"),
                 primary=True,
-            ).pack(side=RIGHT)
-
-            # Summary Generation remains available to regenerate summary
+            ).pack(side=RIGHT, padx=(8, 0))
             self._button(
                 actions,
                 "Summary Generation",
                 lambda: self.show_page("summary"),
-            ).pack(side=RIGHT, padx=(0, 8))
-
-            # Transcript viewing remains available
-            if has_transcripts:
-                self._button(
-                    actions,
-                    "Transcript viewing",
-                    self._continue_from_viewer,
-                ).pack(side=RIGHT, padx=(0, 8))
-
-            self._button(
-                actions,
-                "Export summary",
-                self._export_master_summary,
-            ).pack(side=RIGHT, padx=(0, 8))
-            self._button(
-                actions,
-                "View summary",
-                self._show_master_summary,
-            ).pack(side=RIGHT, padx=(0, 8))
+            ).pack(side=RIGHT)
         else:
-            # Not finalized: Summary Generation is primary
             self._button(
                 actions,
                 "Summary Generation",
@@ -1167,65 +1246,83 @@ class SummaraizerApp:
                 primary=True,
             ).pack(side=RIGHT)
 
-            if has_transcripts:
-                self._button(
-                    actions,
-                    "Transcript viewing" if not compilation.audio_files else "Audio Transcriptions",
-                    self._continue_from_viewer,
-                ).pack(side=RIGHT, padx=(0, 8))
-
             self._button(
                 actions,
                 "Deep Dive",
                 lambda: self.show_page("chat"),
+            ).pack(side=RIGHT, padx=(0, 8))
+        if has_transcripts:
+            self._button(
+                actions,
+                (
+                    "Transcript viewing"
+                    if compilation.master_summary or not compilation.audio_files
+                    else "Audio Transcriptions"
+                ),
+                self._continue_from_viewer,
             ).pack(side=RIGHT, padx=(0, 8))
 
         # Top summary card if finalized
         if compilation.master_summary:
             summary_card = self._card(self.page_container)
-            summary_card.pack(side="top", fill=X, padx=34, pady=(0, 12))
-            summary_header = Frame(summary_card, background=COLORS["surface"])
-            summary_header.pack(fill=X, pady=(0, 8))
+            summary_card.pack(side="top", fill=X, padx=24, pady=(0, 12))
+            summary_content_frame = Frame(
+                summary_card, background=COLORS["surface"], padx=14, pady=12
+            )
+            summary_content_frame.pack(fill=X)
+            summary_header = Frame(
+                summary_content_frame, background=COLORS["surface"]
+            )
+            summary_header.pack(fill=X)
             Label(
                 summary_header,
                 text="Summary.txt",
-                font=("Segoe UI", 12, "bold"),
+                font=("Segoe UI", 13, "bold"),
                 foreground=COLORS["text"],
                 background=COLORS["surface"],
             ).pack(side=LEFT)
             summary_path = self.store.summary_path(compilation)
-            Label(
-                summary_header,
-                text=str(summary_path),
-                font=("Segoe UI", 8),
-                foreground=COLORS["muted"],
-                background=COLORS["surface"],
-            ).pack(side=LEFT, padx=(10, 0))
             self._button(
                 summary_header,
                 "Open",
                 lambda p=summary_path: self._open_file(p),
                 compact=True,
+            ).pack(side=RIGHT, padx=(8, 0))
+            self._button(
+                summary_header,
+                "Export",
+                self._export_master_summary,
+                compact=True,
             ).pack(side=RIGHT)
+            Label(
+                summary_content_frame,
+                text="Finalized compilation summary",
+                font=("Segoe UI", 9),
+                foreground=COLORS["muted"],
+                background=COLORS["surface"],
+                anchor="w",
+            ).pack(fill=X, pady=(3, 8))
             summary_text = (
                 summary_path.read_text(encoding="utf-8")
                 if summary_path.is_file()
                 else compilation.master_summary
             )
-            summary_area = Frame(summary_card, background=COLORS["surface"])
+            summary_area = Frame(
+                summary_content_frame, background=COLORS["surface"]
+            )
             summary_area.pack(fill=X)
             summary_content = Text(
                 summary_area,
                 height=5,
                 wrap="word",
-                font=("Segoe UI", 9),
+                font=("Segoe UI", 11),
                 foreground=COLORS["text"],
                 background="#FAFBFC",
                 relief="flat",
-                padx=10,
-                pady=8,
+                padx=12,
+                pady=10,
             )
-            summary_scroll = ttk.Scrollbar(
+            summary_scroll = AutoHideScrollbar(
                 summary_area,
                 orient=VERTICAL,
                 command=summary_content.yview,
@@ -1238,26 +1335,28 @@ class SummaraizerApp:
 
         # Files panel takes remaining space in the middle
         panel = self._card(self.page_container)
-        panel.pack(side="top", fill=BOTH, expand=True, padx=34, pady=(0, 12))
-        header = Frame(panel, background=COLORS["surface"])
+        panel.pack(side="top", fill=BOTH, expand=True, padx=24, pady=(0, 8))
+        panel_content = Frame(panel, background=COLORS["surface"], padx=14, pady=12)
+        panel_content.pack(fill=BOTH, expand=True)
+        header = Frame(panel_content, background=COLORS["surface"])
         header.pack(fill=X, pady=(0, 12))
         Label(
             header,
             text="Files in this compilation",
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 13, "bold"),
             foreground=COLORS["text"],
             background=COLORS["surface"],
         ).pack(side=LEFT)
         Label(
             header,
             text=f"{len(compilation.files)} files",
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 10),
             foreground=COLORS["muted"],
             background=COLORS["surface"],
         ).pack(side=RIGHT)
 
         drop_zone = ctk.CTkFrame(
-            panel,
+            panel_content,
             fg_color="#EEF2FF",
             border_color="#C7D2FE",
             border_width=1,
@@ -1266,7 +1365,7 @@ class SummaraizerApp:
         drop_zone.pack(fill=X, pady=(0, 12), padx=2)
         Label(
             drop_zone,
-            text="⇧  Drag & drop files here to add them to this compilation",
+            text="Drag and drop files here to add them to this compilation",
             font=("Segoe UI", 10, "bold"),
             foreground=COLORS["accent"],
             background="#EEF2FF",
@@ -1274,8 +1373,12 @@ class SummaraizerApp:
         ).pack(anchor="center")
         Label(
             drop_zone,
-            text="Supported types: .txt, .pdf, .mp3, .wav  (or click to browse)",
-            font=("Segoe UI", 8),
+            text=(
+                "Supported: .txt, .pdf, .mp3, .wav  ·  Click to browse"
+                if self.drag_drop_enabled
+                else "Drag and drop unavailable  ·  Click to browse files"
+            ),
+            font=("Segoe UI", 9),
             foreground=COLORS["muted"],
             background="#EEF2FF",
         ).pack(anchor="center", pady=(2, 0))
@@ -1285,15 +1388,15 @@ class SummaraizerApp:
 
         if not compilation.files:
             Label(
-                panel,
+                panel_content,
                 text="Add documents or audio to get started.",
-                font=("Segoe UI", 10),
+                font=("Segoe UI", 11),
                 foreground=COLORS["muted"],
                 background=COLORS["surface"],
                 pady=22,
             ).pack(anchor="w")
         else:
-            file_list = ScrollableFrame(panel)
+            file_list = ScrollableFrame(panel_content)
             file_list.pack(fill=BOTH, expand=True)
             for path in compilation.files:
                 row = ctk.CTkFrame(
@@ -1305,21 +1408,35 @@ class SummaraizerApp:
                 )
                 row.pack(fill=X, pady=(0, 8))
                 file_type = classify_file(path) or "Unsupported"
-                Label(
+                extension = Path(path).suffix.lower().lstrip(".").upper()
+                badge_colors = {
+                    "PDF": ("#FEF2F2", "#B42318"),
+                    "TXT": ("#EEF2FF", "#4338CA"),
+                    "MP3": ("#F5F3FF", "#6D28D9"),
+                    "WAV": ("#F5F3FF", "#6D28D9"),
+                }
+                badge_background, badge_foreground = badge_colors.get(
+                    extension, (COLORS["accent_light"], COLORS["accent"])
+                )
+                ctk.CTkLabel(
                     row,
-                    text="♪" if file_type == "Audio" else "▤",
-                    font=("Segoe UI", 15, "bold"),
-                    foreground=COLORS["accent"],
-                    background=COLORS["accent_light"],
-                    width=3,
-                    pady=7,
+                    text=extension,
+                    font=("Segoe UI", 9, "bold"),
+                    text_color=badge_foreground,
+                    fg_color=badge_background,
+                    corner_radius=7,
+                    width=44,
+                    height=34,
                 ).pack(side=LEFT, padx=(0, 12))
                 detail = Frame(row, background=COLORS["surface"])
                 detail.pack(side=LEFT, fill=X, expand=True)
+                display_name = Path(path).name
+                if len(display_name) > 56:
+                    display_name = f"{display_name[:25]}...{display_name[-27:]}"
                 Label(
                     detail,
-                    text=Path(path).name,
-                    font=("Segoe UI", 10, "bold"),
+                    text=display_name,
+                    font=("Segoe UI", 11, "bold"),
                     foreground=COLORS["text"],
                     background=COLORS["surface"],
                     anchor="w",
@@ -1327,7 +1444,7 @@ class SummaraizerApp:
                 Label(
                     detail,
                     text=f"{file_type}  ·  {Path(path).suffix.lower()}",
-                    font=("Segoe UI", 9),
+                    font=("Segoe UI", 10),
                     foreground=COLORS["muted"],
                     background=COLORS["surface"],
                     anchor="w",
@@ -1398,10 +1515,10 @@ class SummaraizerApp:
             "Review a sample transcript for each audio file. AI transcription is not connected.",
         )
         body = Frame(self.page_container, background=COLORS["background"])
-        body.pack(fill=BOTH, expand=True, padx=34, pady=(0, 24))
+        body.pack(fill=BOTH, expand=True, padx=24, pady=(0, 20))
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
-        files_panel = self._card(body, width=245)
+        files_panel = self._card(body, width=230)
         files_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
         files_panel.grid_propagate(False)
         Label(
@@ -1414,7 +1531,7 @@ class SummaraizerApp:
         for index, a_path in enumerate(audio_files):
             self._button(
                 files_panel,
-                f"{'●  ' if index == self.audio_index else ''}{Path(a_path).name}",
+                display_filename(a_path, 34),
                 lambda selected=index: self._select_audio(selected),
                 primary=index == self.audio_index,
             ).pack(fill=X, pady=(0, 7))
@@ -1438,8 +1555,8 @@ class SummaraizerApp:
         file_info.pack(side=LEFT, fill=X, expand=True)
         Label(
             file_info,
-            text=Path(path).name,
-            font=("Segoe UI", 11, "bold"),
+            text=display_filename(path, 34),
+            font=("Segoe UI", 12, "bold"),
             foreground=COLORS["text"],
             background=COLORS["surface"],
         ).pack(anchor="w")
@@ -1455,7 +1572,7 @@ class SummaraizerApp:
         self.audio_status_label = Label(
             file_info,
             text=f"Confidence: {confidence}  ·  Ready to play",
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 10),
             foreground=COLORS["muted"],
             background=COLORS["surface"],
         )
@@ -1492,27 +1609,27 @@ class SummaraizerApp:
         player_controls.pack(fill=X)
         self._button(
             player_controls,
-            "▶",
+            "Play",
             lambda selected=path: self._play_audio(selected),
             primary=True,
             compact=True,
         ).pack(side=LEFT)
         self._button(
             player_controls,
-            "Ⅱ",
+            "Pause",
             self._pause_audio,
             compact=True,
         ).pack(side=LEFT, padx=(8, 0))
         self._button(
             player_controls,
-            "■",
+            "Stop",
             self._stop_audio,
             compact=True,
         ).pack(side=LEFT, padx=(8, 12))
         self.audio_time_label = Label(
             player_controls,
             text="0:00 / 0:00",
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 10),
             foreground=COLORS["muted"],
             background="#F8FAFC",
         )
@@ -1565,7 +1682,7 @@ class SummaraizerApp:
         transcript_widget = TranscriptTextbox(
             transcript_card,
             wrap="word",
-            font=("Segoe UI", 10),
+            font=("Segoe UI", 11),
             text_color=COLORS["body"],
             fg_color="#FAFBFC",
             border_color=COLORS["border"],
@@ -1850,12 +1967,12 @@ class SummaraizerApp:
 
         # Body packed fill=BOTH, expand=True
         body = Frame(self.page_container, background=COLORS["background"])
-        body.pack(side="top", fill=BOTH, expand=True, padx=34, pady=(0, 10))
+        body.pack(side="top", fill=BOTH, expand=True, padx=24, pady=(0, 10))
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
 
         # Left files panel (sidebar file traversal buttons)
-        files_panel = self._card(body, width=285)
+        files_panel = self._card(body, width=250)
         files_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
         files_panel.grid_propagate(False)
         Label(
@@ -1867,10 +1984,9 @@ class SummaraizerApp:
         ).pack(anchor="w", pady=(0, 10))
         for index, s_path in enumerate(files):
             done = s_path in self.summary_drafts and bool(self.summary_drafts[s_path].strip())
-            label = f"{'✓' if done else '○'}  {Path(s_path).name}"
             self._button(
                 files_panel,
-                label,
+                f"{'Ready' if done else 'Pending'}  ·  {display_filename(s_path, 28)}",
                 lambda selected=index: self._select_summary_file(selected),
                 primary=index == self.summary_index,
                 pady=11,
@@ -1889,19 +2005,11 @@ class SummaraizerApp:
         card_header.pack(fill=X, pady=(0, 10))
         Label(
             card_header,
-            text=Path(path).name,
-            font=("Segoe UI", 12, "bold"),
+            text=display_filename(path, 42),
+            font=("Segoe UI", 13, "bold"),
             foreground=COLORS["text"],
             background=COLORS["surface"],
         ).pack(side=LEFT)
-        Label(
-            card_header,
-            text="Split-screen comparison: Source file vs Generated summary",
-            font=("Segoe UI", 9),
-            foreground=COLORS["muted"],
-            background=COLORS["surface"],
-        ).pack(side=LEFT, padx=(12, 0))
-
         summary_text = self.summary_drafts.get(path, "")
         if not summary_text:
             transcription = compilation.transcriptions.get(path, "")
@@ -1946,14 +2054,14 @@ class SummaraizerApp:
         source_widget = Text(
             source_text_area,
             wrap="word",
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 10),
             foreground=COLORS["text"],
             background="#F8F9FA",
             relief="flat",
             padx=10,
             pady=8,
         )
-        source_scroll = ttk.Scrollbar(
+        source_scroll = AutoHideScrollbar(
             source_text_area, orient=VERTICAL, command=source_widget.yview
         )
         source_widget.configure(yscrollcommand=source_scroll.set)
@@ -2002,7 +2110,7 @@ class SummaraizerApp:
             padx=10,
             pady=8,
         )
-        summary_scroll = ttk.Scrollbar(
+        summary_scroll = AutoHideScrollbar(
             summary_area, orient=VERTICAL, command=summary_widget.yview
         )
         summary_widget.configure(yscrollcommand=summary_scroll.set)
@@ -2228,7 +2336,7 @@ class SummaraizerApp:
             padx=14,
             pady=14,
         )
-        scrollbar = ttk.Scrollbar(
+        scrollbar = AutoHideScrollbar(
             text_area, orient=VERTICAL, command=summary_text.yview
         )
         summary_text.configure(yscrollcommand=scrollbar.set)
@@ -2278,7 +2386,7 @@ class SummaraizerApp:
             "Ask a question about this compilation. Retrieval-augmented AI is not connected.",
         )
         card = self._card(self.page_container)
-        card.pack(fill=BOTH, expand=True, padx=34, pady=(0, 22))
+        card.pack(fill=BOTH, expand=True, padx=24, pady=(0, 18))
         conversation = ScrollableFrame(card)
         conversation.pack(fill=BOTH, expand=True)
         if not self.chat_messages:
@@ -2305,7 +2413,7 @@ class SummaraizerApp:
             Label(
                 message,
                 text=speaker,
-                font=("Segoe UI", 8, "bold"),
+                font=("Segoe UI", 10, "bold"),
                 foreground="#FFFFFF" if speaker == "You" else COLORS["muted"],
                 background=message_background,
                 padx=12,
@@ -2314,11 +2422,11 @@ class SummaraizerApp:
             Label(
                 message,
                 text=text,
-                font=("Segoe UI", 10),
+                font=("Segoe UI", 11),
                 foreground="#FFFFFF" if speaker == "You" else COLORS["body"],
                 background=message_background,
                 justify=LEFT,
-                wraplength=650,
+                wraplength=560,
                 padx=12,
                 pady=8,
             ).pack(anchor="w")
@@ -2333,26 +2441,49 @@ class SummaraizerApp:
                 ).pack(anchor="w", pady=(8, 0))
         composer = Frame(card, background=COLORS["surface"])
         composer.pack(fill=X, pady=(14, 0))
-        entry = Entry(
+        entry = ctk.CTkTextbox(
             composer,
-            font=("Segoe UI", 10),
-            relief="solid",
-            borderwidth=1,
+            font=("Segoe UI", 11),
+            wrap="word",
+            height=64,
+            corner_radius=9,
+            border_width=1,
+            border_color=COLORS["border"],
+            fg_color="#FAFBFC",
+            text_color=COLORS["text"],
         )
         self.chat_entry = entry
-        entry.pack(side=LEFT, fill=X, expand=True, ipady=9, padx=(0, 10))
+        entry.pack(side=LEFT, fill=X, expand=True, padx=(0, 10))
 
         self._button(
-            composer, "➤  Send", self._send_chat_message, primary=True
+            composer, "Send", self._send_chat_message, primary=True
         ).pack(side=RIGHT)
         self._button(
             composer, "Close", self._close_chat
         ).pack(side=RIGHT, padx=(0, 8))
-        entry.bind("<Return>", lambda _event: self._send_chat_message())
+        ctk.CTkLabel(
+            card,
+            text="Enter to send  ·  Shift + Enter for a new line",
+            font=("Segoe UI", 9),
+            text_color=COLORS["muted"],
+            anchor="w",
+        ).pack(anchor="w", pady=(6, 0))
+
+        def handle_chat_return(event: object) -> str | None:
+            if getattr(event, "state", 0) & 0x0001:
+                return None
+            self._send_chat_message()
+            return "break"
+
+        entry.bind("<Return>", handle_chat_return)
         entry.focus_set()
 
     def _send_chat_message(self) -> None:
-        question = self.chat_entry.get().strip() if self.chat_entry else ""
+        question = (
+            self.chat_entry.get("1.0", "end-1c").strip()
+            if self.chat_entry
+            else ""
+        )
         if not question:
             return
         self.chat_messages.extend(
@@ -2376,7 +2507,6 @@ class SummaraizerApp:
             speaker,
             "The first 10 digits of pi are 3.141592653.",
         )
-        self.retryable_chat_responses.remove(response_index)
         self.show_page("chat")
 
     def _close_chat(self) -> None:

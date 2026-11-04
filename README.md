@@ -15,10 +15,17 @@ python -m pip install -r requirements.txt
 python summaraizer_app.py
 ```
 
-The interface combines Tkinter's native event loop with CustomTkinter cards and
-Pillow-rendered icons. Audio playback supports the common formats accepted by
-pygame. Compilation names, file paths, sample transcriptions, and summaries are
-saved locally in `~/.summaraizer/compilations.json`. Finalized compilations also save
+Keep `summaraizer_app.py` and `mock_ai.py` in the same directory. Run the GUI
+through `summaraizer_app.py`; it imports the mock transcription and summary
+functions from `mock_ai.py`.
+
+The interface combines Tkinter's native event loop with a CustomTkinter
+navigation sidebar, buttons, cards, and editors, plus a Pillow-rendered
+empty-state illustration. Audio playback supports the common formats accepted
+by pygame. The sidebar provides persistent workflow navigation and compilation
+switching; scrollbars appear only when their content needs scrolling.
+Compilation names, file paths, sample transcriptions, and summaries are saved
+locally in `~/.summaraizer/compilations.json`. Finalized compilations also save
 `Summary.txt` under their app data folder, and the viewer displays its contents.
 
 Supported input file extensions match the design: `.txt` and `.pdf` documents,
@@ -26,6 +33,9 @@ plus `.mp3` and `.wav` audio. Files are referenced in place rather than copied.
 Files can be added via the "+ Add files" button or by dragging and dropping them
 directly into the compilation viewer page. Files and finalized summaries can be
 opened directly from the compilation viewer or double-clicked to view.
+On Windows, file drops are registered on the app window and its child controls
+so drops from File Explorer work across the viewer surface; the drop area also
+opens the file picker when clicked.
 
 Adding audio opens transcription automatically with sample transcripts generated
 immediately on open. Transcripts are directly editable, and the primary action
