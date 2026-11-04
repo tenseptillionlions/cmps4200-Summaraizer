@@ -2,18 +2,19 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from tkinter import Button, Label, Text, Tk
+import customtkinter as ctk
+from tkinter import Label, Text, Tk
 from unittest.mock import patch
 
+from mock_ai import mock_summary, mock_transcription
 from summaraizer_app import (
     COLORS,
     Compilation,
     CompilationStore,
+    ScrollableFrame,
     SummaraizerApp,
     aggregate_summaries,
     classify_file,
-    mock_summary,
-    mock_transcription,
     transcript_path_for,
 )
 
@@ -30,7 +31,8 @@ class FileTypeTests(unittest.TestCase):
         sample, low_confidence = mock_transcription("interview.mp3")
         self.assertIn("interview", sample)
         self.assertFalse(low_confidence)
-        self.assertGreater(sample.count("\n\n"), 5)
+        self.assertEqual(sample.count("Sample transcription for"), 1)
+        self.assertEqual(sample.count("[0:30]"), 1)
 
         sample, low_confidence = mock_transcription("unclear-audio.wav")
         self.assertIn("Low confidence", sample)
@@ -121,12 +123,13 @@ class GuiIntuitionTests(unittest.TestCase):
         self.app._set_active(self.compilation)
 
     def tearDown(self) -> None:
+        self.root.update_idletasks()
         self.root.destroy()
         self.temp_dir.cleanup()
 
-    def _find_buttons(self, widget: object) -> list[Button]:
-        res: list[Button] = []
-        if isinstance(widget, Button):
+    def _find_buttons(self, widget: object) -> list[ctk.CTkButton]:
+        res: list[ctk.CTkButton] = []
+        if isinstance(widget, ctk.CTkButton):
             res.append(widget)
         if hasattr(widget, "winfo_children"):
             for child in widget.winfo_children():
@@ -198,7 +201,7 @@ class GuiIntuitionTests(unittest.TestCase):
         save_edits_btns = [b for b in buttons if b.cget("text") == "Save Edits"]
         self.assertEqual(len(save_edits_btns), 1)
         save_edits_btn = save_edits_btns[0]
-        self.assertEqual(save_edits_btn.cget("background"), COLORS["success"])
+        self.assertEqual(save_edits_btn.cget("fg_color"), COLORS["success"])
 
         # User edits transcription and saves
         self.assertIsNotNone(self.app.transcription_editor)
@@ -250,14 +253,12 @@ class GuiIntuitionTests(unittest.TestCase):
         self.assertIn("Save", btn_texts)
         self.assertNotIn("Finalize", btn_texts)
         next_btn = next(b for b in buttons if b.cget("text") == "Next File")
-        self.assertEqual(next_btn.cget("background"), COLORS["accent"])
-        self.assertEqual(int(next_btn.cget("padx")), 16)
-        self.assertEqual(int(next_btn.cget("pady")), 10)
+        self.assertEqual(next_btn.cget("fg_color"), COLORS["accent"])
+        self.assertEqual(int(next_btn.cget("height")), 44)
         for action_text in ("Open file", "Regenerate"):
             action_btn = next(b for b in buttons if b.cget("text") == action_text)
-            self.assertEqual(action_btn.cget("background"), COLORS["accent"])
-            self.assertEqual(int(action_btn.cget("padx")), 10)
-            self.assertEqual(int(action_btn.cget("pady")), 6)
+            self.assertEqual(action_btn.cget("fg_color"), COLORS["accent"])
+            self.assertEqual(int(action_btn.cget("height")), 36)
         self.assertNotIn("Reset to mock", btn_texts)
         save_btn = next(b for b in buttons if b.cget("text") == "Save")
         cancel_btn = next(b for b in buttons if b.cget("text") == "Cancel")
@@ -280,9 +281,8 @@ class GuiIntuitionTests(unittest.TestCase):
         finalize_btn = next(b for b in buttons2 if b.cget("text") == "Finalize")
         self.assertEqual(previous_btn.master, finalize_btn.master)
         self.assertEqual(previous_btn.master.pack_info()["side"], "right")
-        self.assertEqual(finalize_btn.cget("background"), COLORS["accent"])
-        self.assertEqual(int(finalize_btn.cget("padx")), 16)
-        self.assertEqual(int(finalize_btn.cget("pady")), 10)
+        self.assertEqual(finalize_btn.cget("fg_color"), COLORS["accent"])
+        self.assertEqual(int(finalize_btn.cget("height")), 44)
 
         # Finalize compilation
         self.app._finalize_summary()
@@ -294,7 +294,7 @@ class GuiIntuitionTests(unittest.TestCase):
         viewer_buttons = self._find_buttons(self.app.page_container)
         viewer_map = {b.cget("text"): b for b in viewer_buttons}
         self.assertIn("Deep Dive", viewer_map)
-        self.assertEqual(viewer_map["Deep Dive"].cget("background"), COLORS["accent"])
+        self.assertEqual(viewer_map["Deep Dive"].cget("fg_color"), COLORS["accent"])
         self.assertIn("Summary Generation", viewer_map)
         self.assertIn("Transcript viewing", viewer_map)
 
@@ -345,13 +345,100 @@ class GuiIntuitionTests(unittest.TestCase):
 
     def test_chat_page_keeps_send_flow(self) -> None:
         self.app.show_page("chat")
-        self.app.chat_entry.insert(0, "What is in this compilation?")
+        self.app.chat_entry.insert("1.0", "What is in this compilation?")
 
         self.app._send_chat_message()
 
         self.assertEqual(self.app.active_page, "chat")
         self.assertEqual(self.app.chat_messages[0][0], "You")
         self.assertEqual(self.app.chat_messages[0][1], "What is in this compilation?")
+
+    def test_sidebar_keeps_workflow_navigation_and_compilations_visible(self) -> None:
+        self.app.show_page("viewer")
+        nav_text = [
+            widget.cget("text") for widget in self.app.sidebar_nav.winfo_children()
+        ]
+        compilation_text = [
+            widget.cget("text")
+            for widget in self.app.sidebar_compilations.content.winfo_children()
+        ]
+
+        self.assertEqual(
+            nav_text,
+            ["Home", "Files", "Transcription", "Summary", "Deep Dive"],
+        )
+        self.assertTrue(any("TestComp" in text for text in compilation_text))
+        self.app.show_page("viewer")
+        self.assertEqual(len(self.app.sidebar_compilations.content.winfo_children()), 1)
+
+    def test_shell_removes_duplicate_header_and_uses_large_empty_state_action(self) -> None:
+        self.app.compilations.clear()
+        self.app.active_compilation = None
+        self.app.show_page("home")
+
+        self.assertFalse(hasattr(self.app, "page_title"))
+        buttons = self._find_buttons(self.app.page_container)
+        create_button = next(
+            button
+            for button in buttons
+            if button.cget("text") == "+  Create your first compilation"
+        )
+        self.assertGreaterEqual(int(create_button.cget("height")), 56)
+        self.assertGreaterEqual(int(create_button.cget("width")), 300)
+
+    def test_scrollbar_hides_when_not_needed_and_appears_for_overflow(self) -> None:
+        scrollable = ScrollableFrame(self.root)
+        scrollable.pack(fill="both", expand=True)
+        self.root.update_idletasks()
+        self.assertFalse(scrollable.scrollbar.winfo_manager())
+
+        for index in range(40):
+            Label(scrollable.content, text=f"Row {index}").pack()
+        self.root.update_idletasks()
+        self.assertEqual(scrollable.scrollbar.winfo_manager(), "pack")
+        scrollable.destroy()
+        self.root.update_idletasks()
+
+    def test_mousewheel_scrolls_when_pointer_is_over_a_list_item(self) -> None:
+        scrollable = ScrollableFrame(self.root)
+        scrollable.pack(fill="both", expand=True)
+        item = None
+        for index in range(40):
+            item = Label(scrollable.content, text=f"Row {index}")
+            item.pack()
+        self.root.update_idletasks()
+
+        self.assertIsNotNone(item)
+        self.assertLessEqual(float(scrollable.canvas.yview()[0]), 0.001)
+        item.event_generate("<MouseWheel>", delta=-120)
+        self.root.update_idletasks()
+        self.assertGreater(float(scrollable.canvas.yview()[0]), 0)
+
+    def test_sidebar_compilation_list_scrolls_when_it_overflows(self) -> None:
+        self.app.compilations = [
+            Compilation.create(f"Collection {index}") for index in range(30)
+        ]
+        self.app._refresh_sidebar()
+        self.root.update_idletasks()
+
+        self.assertEqual(self.app.sidebar_compilations.scrollbar.winfo_manager(), "pack")
+
+    def test_chat_retry_remains_available_after_multiple_retries(self) -> None:
+        self.app.show_page("chat")
+        self.app.chat_entry.insert("1.0", "What is in this compilation?")
+        self.app._send_chat_message()
+        response_index = len(self.app.chat_messages) - 1
+
+        self.app._retry_chat_response(response_index)
+        self.assertIn(response_index, self.app.retryable_chat_responses)
+        self.app._retry_chat_response(response_index)
+        self.assertIn(response_index, self.app.retryable_chat_responses)
+        retry_buttons = [
+            button
+            for button in self._find_buttons(self.app.page_container)
+            if button.cget("text") == "Retry"
+        ]
+        self.assertEqual(len(retry_buttons), 1)
 
 if __name__ == "__main__":
     unittest.main()
