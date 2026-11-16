@@ -1,3 +1,8 @@
 pygame>=2.5,<3
 customtkinter>=5.2,<6
 Pillow>=10,<12
+torch>=2.2,<3
+transformers>=4.51,<5
+accelerate>=0.34,<2
+pypdf>=5,<7
+librosa>=0.10.2,<1

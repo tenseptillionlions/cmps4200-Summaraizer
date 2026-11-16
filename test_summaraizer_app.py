@@ -1,12 +1,15 @@
 import json
+import queue
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 import customtkinter as ctk
 from tkinter import Label, Text, Tk
 from unittest.mock import patch
 
-from mock_ai import mock_summary, mock_transcription
+import ai_backend
 from summaraizer_app import (
     COLORS,
     Compilation,
@@ -27,30 +30,6 @@ class FileTypeTests(unittest.TestCase):
         self.assertIsNone(classify_file("notes.docx"))
         self.assertIsNone(classify_file("archive.zip"))
 
-    def test_transcription_has_normal_and_low_confidence_samples(self) -> None:
-        sample, low_confidence = mock_transcription("interview.mp3")
-        self.assertIn("interview", sample)
-        self.assertFalse(low_confidence)
-        self.assertEqual(sample.count("Sample transcription for"), 1)
-        self.assertEqual(sample.count("[0:30]"), 1)
-
-        sample, low_confidence = mock_transcription("unclear-audio.wav")
-        self.assertIn("Low confidence", sample)
-        self.assertTrue(low_confidence)
-
-        sample, low_confidence = mock_transcription("silent-room.wav")
-        self.assertIn("No speech could be detected", sample)
-        self.assertTrue(low_confidence)
-
-    def test_summary_uses_transcription_state(self) -> None:
-        no_speech, _ = mock_transcription("empty.wav")
-        self.assertIn("no transcript", mock_summary("empty.wav", no_speech))
-        self.assertIn("AI is not connected", mock_summary("notes.pdf"))
-        self.assertIn(
-            "audio transcription",
-            mock_summary("recording-transcript.txt").lower(),
-        )
-
     def test_transcript_path_replaces_audio_extension(self) -> None:
         self.assertEqual(
             transcript_path_for(Path("recording.mp3")).name,
@@ -70,6 +49,342 @@ class FileTypeTests(unittest.TestCase):
             [Path(path).name for path in compilation.summary_files],
             ["notes.txt", "recording-transcript.txt", "scan.pdf"],
         )
+
+
+class LocalAIBackendTests(unittest.TestCase):
+    def test_uses_models_from_the_sample_implementations(self) -> None:
+        self.assertEqual(ai_backend.TRANSCRIPTION_MODEL, "openai/whisper-medium")
+        self.assertEqual(ai_backend.TEXT_MODEL, "Qwen/Qwen3-4B-Instruct-2507")
+        self.assertEqual(ai_backend.CPU_TRANSCRIPTION_MODEL, "openai/whisper-small")
+        self.assertEqual(ai_backend.CPU_TEXT_MODEL, "Qwen/Qwen3-0.6B")
+
+    def test_cpu_generator_uses_small_model_without_disk_offloading(self) -> None:
+        captured: dict[str, object] = {}
+        torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: False),
+            float16="float16",
+            float32="float32",
+        )
+
+        def pipeline(task: str, **kwargs: object) -> str:
+            captured.update(task=task, **kwargs)
+            return "cpu-generator"
+
+        with patch.object(ai_backend, "_generator", None), patch.object(
+            ai_backend, "_load_runtime", return_value=(torch, pipeline)
+        ):
+            self.assertEqual(ai_backend._get_generator(), "cpu-generator")
+
+        self.assertEqual(captured["model"], ai_backend.CPU_TEXT_MODEL)
+        self.assertEqual(captured["device"], -1)
+        self.assertNotIn("device_map", captured)
+
+    def test_limited_cuda_memory_uses_small_text_model_on_gpu(self) -> None:
+        captured: dict[str, object] = {}
+        torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(
+                is_available=lambda: True,
+                mem_get_info=lambda: (4 * 1024**3, 8 * 1024**3),
+            ),
+            float16="float16",
+            float32="float32",
+        )
+
+        def pipeline(task: str, **kwargs: object) -> str:
+            captured.update(task=task, **kwargs)
+            return "small-gpu-generator"
+
+        with patch.object(ai_backend, "_generator", None), patch.object(
+            ai_backend, "_load_runtime", return_value=(torch, pipeline)
+        ):
+            self.assertEqual(ai_backend._get_generator(), "small-gpu-generator")
+
+        self.assertEqual(captured["model"], ai_backend.CPU_TEXT_MODEL)
+        self.assertEqual(captured["device"], 0)
+        self.assertNotIn("device_map", captured)
+
+    def test_sufficient_cuda_memory_keeps_sample_text_model(self) -> None:
+        captured: dict[str, object] = {}
+        torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(
+                is_available=lambda: True,
+                mem_get_info=lambda: (12 * 1024**3, 16 * 1024**3),
+            ),
+            float16="float16",
+            float32="float32",
+        )
+
+        def pipeline(task: str, **kwargs: object) -> str:
+            captured.update(task=task, **kwargs)
+            return "large-gpu-generator"
+
+        with patch.object(ai_backend, "_generator", None), patch.object(
+            ai_backend, "_load_runtime", return_value=(torch, pipeline)
+        ):
+            self.assertEqual(ai_backend._get_generator(), "large-gpu-generator")
+
+        self.assertEqual(captured["model"], ai_backend.TEXT_MODEL)
+        self.assertEqual(captured["device_map"], "auto")
+        self.assertNotIn("device", captured)
+
+    def test_cpu_transcriber_selects_small_whisper_model(self) -> None:
+        captured: dict[str, object] = {}
+        torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_available=lambda: False),
+            float16="float16",
+            float32="float32",
+        )
+
+        def pipeline(task: str, **kwargs: object) -> str:
+            captured.update(task=task, **kwargs)
+            return "cpu-transcriber"
+
+        with patch.object(ai_backend, "_transcriber", None), patch.object(
+            ai_backend, "_load_runtime", return_value=(torch, pipeline)
+        ):
+            self.assertEqual(ai_backend._get_transcriber(), "cpu-transcriber")
+
+        self.assertEqual(captured["model"], ai_backend.CPU_TRANSCRIPTION_MODEL)
+        self.assertEqual(captured["device"], -1)
+
+    def test_limited_cuda_memory_uses_small_whisper_model_on_gpu(self) -> None:
+        captured: dict[str, object] = {}
+        torch = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(
+                is_available=lambda: True,
+                mem_get_info=lambda: (2 * 1024**3, 8 * 1024**3),
+            ),
+            float16="float16",
+            float32="float32",
+        )
+
+        def pipeline(task: str, **kwargs: object) -> str:
+            captured.update(task=task, **kwargs)
+            return "small-gpu-transcriber"
+
+        with patch.object(ai_backend, "_transcriber", None), patch.object(
+            ai_backend, "_load_runtime", return_value=(torch, pipeline)
+        ):
+            self.assertEqual(
+                ai_backend._get_transcriber(), "small-gpu-transcriber"
+            )
+
+        self.assertEqual(captured["model"], ai_backend.CPU_TRANSCRIPTION_MODEL)
+        self.assertEqual(captured["device"], 0)
+
+    def test_reads_text_documents_and_rejects_blank_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "notes.txt"
+            path.write_text("Important local notes.", encoding="utf-8")
+            self.assertEqual(ai_backend.read_document_text(path), "Important local notes.")
+            path.write_text("  \n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "No readable text"):
+                ai_backend.read_document_text(path)
+
+    def test_selects_embedding_device_instead_of_disk_offload_device(self) -> None:
+        cpu_device = types.SimpleNamespace(type="cpu")
+        embeddings = types.SimpleNamespace(weight=types.SimpleNamespace(device=cpu_device))
+
+        class OffloadedModel:
+            device = "disk"
+
+            def get_input_embeddings(self) -> object:
+                return embeddings
+
+            def named_modules(self) -> list[tuple[str, object]]:
+                return [("model.embed_tokens", embeddings)]
+
+        selected = ai_backend._input_device(
+            OffloadedModel(),
+            types.SimpleNamespace(device=lambda device: device),
+        )
+        self.assertIs(selected, cpu_device)
+
+    def test_normalizes_string_disk_embedding_to_a_compute_device(self) -> None:
+        embeddings = types.SimpleNamespace(weight=types.SimpleNamespace(device="disk"))
+
+        class OffloadedModel:
+            device = "disk"
+            hf_device_map = {
+                "model.embed_tokens": "disk",
+                "model.layers.0": "disk",
+            }
+
+            def get_input_embeddings(self) -> object:
+                return embeddings
+
+            def named_modules(self) -> list[tuple[str, object]]:
+                return [("model.embed_tokens", embeddings)]
+
+        def make_device(candidate: object) -> object:
+            return types.SimpleNamespace(type=str(candidate).split(":")[0])
+
+        selected = ai_backend._input_device(
+            OffloadedModel(),
+            types.SimpleNamespace(device=make_device),
+        )
+        self.assertEqual(selected.type, "cpu")
+
+    def test_pipeline_runtime_patch_handles_disk_offloaded_device_map(self) -> None:
+        ai_backend._patch_runtime_for_disk_offload()
+        from accelerate.utils import offload as accelerate_offload
+
+        # Verify OffloadedWeightsLoader tied weight fallback
+        loader = accelerate_offload.OffloadedWeightsLoader(
+            state_dict={"model.embed_tokens.weight": "tensor_model_embed"}
+        )
+        self.assertEqual(loader["lm_head.weight"], "tensor_model_embed")
+
+    def test_summary_and_deep_dive_use_separate_source_grounded_prompts(self) -> None:
+        with patch.object(ai_backend, "_generate", return_value="Generated locally") as generate:
+            self.assertEqual(
+                ai_backend.summarize_text("Source details.", "notes.txt"),
+                "Generated locally",
+            )
+            summary_messages = generate.call_args.args[0]
+            self.assertIn("notes.txt", summary_messages[1]["content"])
+            self.assertIn("Source details.", summary_messages[1]["content"])
+
+            self.assertEqual(
+                ai_backend.answer_question("What happened?", "A local event."),
+                "Generated locally",
+            )
+            question_messages = generate.call_args.args[0]
+            self.assertIn("A local event.", question_messages[1]["content"])
+            self.assertIn("What happened?", question_messages[1]["content"])
+            self.assertFalse(generate.call_args.kwargs["enable_thinking"])
+
+    def test_summary_prompt_limits_input_and_requests_one_short_paragraph(self) -> None:
+        source = "A" * (ai_backend.SUMMARY_INPUT_MAX_CHARS + 500)
+        with patch.object(ai_backend, "_generate", return_value="Short summary.") as generate:
+            result = ai_backend.summarize_text(source, "long.txt")
+
+        self.assertEqual(result, "Short summary.")
+        prompt = generate.call_args.args[0]
+        self.assertIn("exactly one concise paragraph", prompt[0]["content"])
+        self.assertIn("4-5 short sentences", prompt[0]["content"])
+        self.assertIn("quick readability", prompt[0]["content"])
+        self.assertIn("40-70 words total", prompt[0]["content"])
+        self.assertIn(
+            source[: ai_backend.SUMMARY_INPUT_MAX_CHARS],
+            prompt[1]["content"],
+        )
+        self.assertIn("Remaining source text omitted", prompt[1]["content"])
+        self.assertEqual(
+            generate.call_args.kwargs["max_new_tokens"],
+            ai_backend.SUMMARY_MAX_NEW_TOKENS,
+        )
+        self.assertFalse(generate.call_args.kwargs["enable_thinking"])
+
+    def test_transcription_formats_local_model_segments_with_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audio.wav"
+            path.write_bytes(b"audio")
+            streamed: list[str] = []
+            progress: list[str] = []
+            librosa = types.ModuleType("librosa")
+            librosa.load = lambda *_args, **_kwargs: ([0.0] * 4, 2)
+
+            def recognize(_audio: object) -> dict[str, str]:
+                return {"text": "Hello world"}
+
+            with patch.object(
+                ai_backend,
+                "_get_transcriber",
+                return_value=recognize,
+            ), patch.dict(sys.modules, {"librosa": librosa}):
+                self.assertEqual(
+                    ai_backend.transcribe_audio(
+                        path,
+                        on_progress=progress.append,
+                        on_chunk=streamed.append,
+                    ),
+                    "[0:00] Hello world",
+                )
+            self.assertEqual(streamed, ["[0:00] Hello world\n"])
+            self.assertIn("Transcribing audio segment 1 of 1…", progress)
+
+    def test_text_generation_streams_model_output_and_loading_status(self) -> None:
+        streamed: list[str] = []
+        progress: list[str] = []
+
+        class FakeStreamer:
+            def __init__(self, _tokenizer: object, **_kwargs: object) -> None:
+                self.chunks: queue.Queue[str | None] = queue.Queue()
+
+            def __iter__(self) -> object:
+                return self
+
+            def __next__(self) -> str:
+                chunk = self.chunks.get(timeout=2)
+                if chunk is None:
+                    raise StopIteration
+                return chunk
+
+        class FakeInputs(dict):
+            def to(self, _device: str) -> object:
+                return self
+
+        class FakeTokenizer:
+            eos_token_id = 0
+
+            def apply_chat_template(
+                self, _messages: object, **_kwargs: object
+            ) -> str:
+                return "prompt"
+
+            def __call__(self, _prompt: str, **_kwargs: object) -> FakeInputs:
+                return FakeInputs()
+
+        class FakeModel:
+            device = "cpu"
+
+            def generate(self, *, streamer: FakeStreamer, **_kwargs: object) -> None:
+                for chunk in ("Hello", " ", "world"):
+                    streamer.chunks.put(chunk)
+                streamer.chunks.put(None)
+
+        class FakeGenerator:
+            model = FakeModel()
+            tokenizer = FakeTokenizer()
+
+        transformers = types.ModuleType("transformers")
+        transformers.TextIteratorStreamer = FakeStreamer
+        with patch.object(
+            ai_backend, "_get_generator", return_value=FakeGenerator()
+        ), patch.dict(sys.modules, {"transformers": transformers}):
+            answer = ai_backend._generate(
+                [{"role": "user", "content": "Question"}],
+                max_new_tokens=8,
+                on_progress=progress.append,
+                on_chunk=streamed.append,
+            )
+
+        self.assertEqual(answer, "Hello world")
+        self.assertEqual(streamed, ["Hello", " ", "world"])
+        self.assertIn("Generating response…", progress)
+
+    def test_model_loading_reports_runtime_download_and_ready_states(self) -> None:
+        progress: list[str] = []
+        torch = types.ModuleType("torch")
+        torch.cuda = types.SimpleNamespace(is_available=lambda: False)
+        torch.float16 = "float16"
+        torch.float32 = "float32"
+        transformers = types.ModuleType("transformers")
+        transformers.pipeline = lambda *_args, **_kwargs: object()
+        with patch.object(ai_backend, "_generator", None), patch.dict(
+            sys.modules, {"torch": torch, "transformers": transformers}
+        ):
+            ai_backend._get_generator(progress.append)
+
+        self.assertIn("Preparing the local AI runtime…", progress)
+        self.assertIn(
+            "Loading Qwen 3 locally. First use may download model files.", progress
+        )
+        self.assertIn(
+            "Loading the smaller Qwen/Qwen3-0.6B CPU model…", progress
+        )
+        self.assertIn("Qwen 3 is ready.", progress)
 
 
 class CompilationStoreTests(unittest.TestCase):
@@ -118,6 +433,49 @@ class GuiIntuitionTests(unittest.TestCase):
         self.root.withdraw()
         self.store = CompilationStore(Path(self.temp_dir.name) / "compilations.json")
         self.app = SummaraizerApp(self.root, self.store)
+
+        def fake_transcribe(path, on_progress=None, on_chunk=None):
+            transcript = f"Transcript for {Path(path).name}"
+            if on_chunk:
+                on_chunk(transcript + "\n")
+            return transcript
+
+        def fake_summarize(path, on_progress=None, on_chunk=None):
+            summary = f"Local summary for {Path(path).name}. " * 4
+            if on_chunk:
+                on_chunk(summary)
+            return summary
+
+        def fake_answer(_question, _context, on_progress=None, on_chunk=None):
+            answer = "Answer from local compilation context."
+            if on_chunk:
+                on_chunk("Answer from local ")
+                on_chunk("compilation context.")
+            return answer
+
+        self.ai_patches = [
+            patch("summaraizer_app.transcribe_audio", side_effect=fake_transcribe),
+            patch("summaraizer_app.summarize_document", side_effect=fake_summarize),
+            patch("summaraizer_app.answer_question", side_effect=fake_answer),
+        ]
+        for ai_patch in self.ai_patches:
+            ai_patch.start()
+
+        def run_ai_task(task, on_success, _error_title, on_error=None, on_progress=None, on_chunk=None):
+            try:
+                on_success(
+                    task(
+                        on_progress or (lambda _message: None),
+                        on_chunk or (lambda _chunk: None),
+                    )
+                )
+            except Exception as error:
+                if on_error is not None:
+                    on_error(error)
+                else:
+                    raise
+
+        self.app._run_ai_task = run_ai_task
         self.compilation = Compilation.create("TestComp")
         self.app.compilations.append(self.compilation)
         self.app._set_active(self.compilation)
@@ -126,6 +484,8 @@ class GuiIntuitionTests(unittest.TestCase):
         self.root.update_idletasks()
         self.root.destroy()
         self.temp_dir.cleanup()
+        for ai_patch in self.ai_patches:
+            ai_patch.stop()
 
     def _find_buttons(self, widget: object) -> list[ctk.CTkButton]:
         res: list[ctk.CTkButton] = []
@@ -185,16 +545,24 @@ class GuiIntuitionTests(unittest.TestCase):
             self.app._open_file(str(doc_path))
             mock_start.assert_called_once_with(str(doc_path.resolve()))
 
-    def test_mock_transcription_and_save_edits_button(self) -> None:
+    def test_local_transcription_and_save_edits_button(self) -> None:
         audio_path = Path(self.temp_dir.name) / "audio.mp3"
         audio_path.write_text("audio bytes", encoding="utf-8")
         self.compilation.files.append(str(audio_path.resolve()))
 
-        # Mock transcription generated upon opening without pressing generate
         self.app.show_page("transcription")
         resolved = str(audio_path.resolve())
+        self.assertNotIn(resolved, self.app.transcription_drafts)
+        self.app._generate_transcription(resolved)
         self.assertIn(resolved, self.app.transcription_drafts)
-        self.assertTrue(len(self.app.transcription_drafts[resolved]) > 0)
+        self.assertEqual(
+            self.app.transcription_drafts[resolved],
+            "Transcript for audio.mp3",
+        )
+        self.assertEqual(
+            self.app.transcription_editor.get("1.0", "end-1c"),
+            "Transcript for audio.mp3",
+        )
 
         # Primary button is "Save Edits"
         buttons = self._find_buttons(self.app.page_container)
@@ -231,10 +599,9 @@ class GuiIntuitionTests(unittest.TestCase):
             str(f3.resolve()),
         ]
 
-        # Generate mock summaries upon opening
+        # Generate local summaries upon opening and moving between files.
         self.app.show_page("summary")
         self.assertIn(str(f1.resolve()), self.app.summary_drafts)
-        self.assertIn(str(f2.resolve()), self.app.summary_drafts)
 
         # Split-screen comparison format: source text and summary editor
         texts = self._find_texts(self.app.page_container)
@@ -259,7 +626,7 @@ class GuiIntuitionTests(unittest.TestCase):
             action_btn = next(b for b in buttons if b.cget("text") == action_text)
             self.assertEqual(action_btn.cget("fg_color"), COLORS["accent"])
             self.assertEqual(int(action_btn.cget("height")), 36)
-        self.assertNotIn("Reset to mock", btn_texts)
+        self.assertNotIn("Reset sample", btn_texts)
         save_btn = next(b for b in buttons if b.cget("text") == "Save")
         cancel_btn = next(b for b in buttons if b.cget("text") == "Cancel")
         self.assertEqual(save_btn.master, cancel_btn.master)
@@ -310,7 +677,7 @@ class GuiIntuitionTests(unittest.TestCase):
         ]
         self.assertNotIn("Master summary finalized", finalized_labels)
 
-    def test_summary_regeneration_streams_into_editor(self) -> None:
+    def test_summary_generation_streams_directly_into_editor(self) -> None:
         source = Path(self.temp_dir.name) / "streamed.txt"
         source.write_text("A source document.", encoding="utf-8")
         source_path = str(source.resolve())
@@ -321,29 +688,34 @@ class GuiIntuitionTests(unittest.TestCase):
 
         generated = self.app.summary_drafts[source_path]
         self.assertIsNotNone(self.app.summary_progress)
-        self.assertLess(
-            len(self.app.summary_editor.get("1.0", "end-1c")),
-            len(generated),
-        )
-        while self.app.summary_streaming_path is not None:
-            if self.app.summary_stream_after is not None:
-                self.root.after_cancel(self.app.summary_stream_after)
-                self.app.summary_stream_after = None
-            offset = len(self.app.summary_editor.get("1.0", "end-1c"))
-            self.app._stream_summary_text(
-                source_path,
-                generated,
-                self.app.summary_stream_generation,
-                offset,
-            )
-
         self.assertIsNone(self.app.summary_streaming_path)
         self.assertEqual(
             self.app.summary_editor.get("1.0", "end-1c"),
             generated,
         )
 
+    def test_chat_streams_answer_into_conversation(self) -> None:
+        source = Path(self.temp_dir.name) / "chat.txt"
+        source.write_text("The compilation discusses local testing.", encoding="utf-8")
+        self.compilation.files = [str(source.resolve())]
+        self.app.show_page("chat")
+        self.app.chat_entry.insert("1.0", "What is in this compilation?")
+
+        self.app._send_chat_message()
+
+        self.assertEqual(
+            self.app.chat_messages[-1],
+            ("Summaraizer", "Answer from local compilation context."),
+        )
+        self.assertEqual(
+            self.app.chat_message_labels[len(self.app.chat_messages) - 1].cget("text"),
+            "Answer from local compilation context.",
+        )
+
     def test_chat_page_keeps_send_flow(self) -> None:
+        source = Path(self.temp_dir.name) / "chat.txt"
+        source.write_text("The compilation discusses local testing.", encoding="utf-8")
+        self.compilation.files = [str(source.resolve())]
         self.app.show_page("chat")
         self.app.chat_entry.insert("1.0", "What is in this compilation?")
 
@@ -424,6 +796,9 @@ class GuiIntuitionTests(unittest.TestCase):
         self.assertEqual(self.app.sidebar_compilations.scrollbar.winfo_manager(), "pack")
 
     def test_chat_retry_remains_available_after_multiple_retries(self) -> None:
+        source = Path(self.temp_dir.name) / "chat.txt"
+        source.write_text("The compilation discusses local testing.", encoding="utf-8")
+        self.compilation.files = [str(source.resolve())]
         self.app.show_page("chat")
         self.app.chat_entry.insert("1.0", "What is in this compilation?")
         self.app._send_chat_message()
