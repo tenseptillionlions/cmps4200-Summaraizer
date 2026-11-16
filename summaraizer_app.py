@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -32,7 +33,12 @@ from tkinter import (
 )
 from typing import Callable
 
-from mock_ai import mock_summary, mock_transcription
+from ai_backend import (
+    answer_question,
+    read_document_text,
+    summarize_document,
+    transcribe_audio,
+)
 
 
 APP_NAME = "Summaraizer"
@@ -302,8 +308,7 @@ class SummaraizerApp:
         self.summary_editor_path: str | None = None
         self.summary_drafts: dict[str, str] = {}
         self.summary_progress: ctk.CTkProgressBar | None = None
-        self.summary_stream_after: str | None = None
-        self.summary_stream_generation = 0
+        self.summary_status_label: Label | None = None
         self.summary_streaming_path: str | None = None
         self.transcription_editor: Text | TranscriptTextbox | None = None
         self.transcription_editor_path: str | None = None
@@ -316,7 +321,9 @@ class SummaraizerApp:
         self._drop_window_procs: dict[int, tuple[int, object]] = {}
         self.chat_entry: ctk.CTkTextbox | None = None
         self.chat_messages: list[tuple[str, str]] = []
+        self.chat_message_labels: dict[int, Label] = {}
         self.retryable_chat_responses: set[int] = set()
+        self.ai_task_running = False
         self.page_container: ctk.CTkFrame
         self.sidebar_nav: ctk.CTkFrame
         self.sidebar_compilations: ScrollableFrame
@@ -598,12 +605,75 @@ class SummaraizerApp:
             return None
         return self.active_compilation
 
+    def _run_ai_task(
+        self,
+        task: Callable[[Callable[[str], None], Callable[[str], None]], str],
+        on_success: Callable[[str], None],
+        error_title: str,
+        on_error: Callable[[Exception], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> None:
+        if self.ai_task_running:
+            error = RuntimeError("Wait for the current model operation to finish.")
+            if self.summary_progress is not None:
+                self.summary_progress.stop()
+                self.summary_progress.pack_forget()
+            messagebox.showinfo(
+                "Local AI is busy",
+                str(error),
+                parent=self.root,
+            )
+            if on_error is not None:
+                on_error(error)
+            return
+        self.ai_task_running = True
+
+        def dispatch(callback: Callable[[str], None] | None) -> Callable[[str], None]:
+            def notify(value: str) -> None:
+                if callback is None:
+                    return
+                try:
+                    self.root.after(0, lambda: callback(value))
+                except TclError:
+                    pass
+
+            return notify
+
+        def run() -> None:
+            try:
+                result = task(dispatch(on_progress), dispatch(on_chunk))
+            except Exception as error:
+                def report_error(captured_error: Exception = error) -> None:
+                    self.ai_task_running = False
+                    if self.summary_progress is not None:
+                        self.summary_progress.stop()
+                        self.summary_progress.pack_forget()
+                    messagebox.showerror(
+                        error_title, str(captured_error), parent=self.root
+                    )
+                    if on_error is not None:
+                        on_error(captured_error)
+
+                try:
+                    self.root.after(0, report_error)
+                except TclError:
+                    pass
+                return
+
+            def report_success() -> None:
+                self.ai_task_running = False
+                on_success(result)
+
+            try:
+                self.root.after(0, report_success)
+            except TclError:
+                pass
+
+        threading.Thread(target=run, daemon=True, name="local-ai").start()
+
     def show_page(self, page: str) -> None:
         previous_page = self.active_page
-        self.summary_stream_generation += 1
-        if self.summary_stream_after is not None:
-            self.root.after_cancel(self.summary_stream_after)
-            self.summary_stream_after = None
         if self.summary_progress is not None:
             self.summary_progress.stop()
             self.summary_progress = None
@@ -612,33 +682,16 @@ class SummaraizerApp:
             self.audio_position_after = None
         if self.drag_drop_enabled:
             self._restore_drop_targets()
-        self.summary_streaming_path = None
         if page == "summary":
             compilation = self.active_compilation
             if compilation is not None:
                 if previous_page != "summary":
                     self.summary_drafts = dict(compilation.summaries)
-                for s_path in compilation.summary_files:
-                    if (
-                        s_path not in self.summary_drafts
-                        or not self.summary_drafts[s_path].strip()
-                    ):
-                        transcription = compilation.transcriptions.get(s_path, "")
-                        self.summary_drafts[s_path] = mock_summary(
-                            s_path, transcription
-                        )
         if page == "transcription":
             compilation = self.active_compilation
             if compilation is not None:
                 if previous_page != "transcription":
                     self.transcription_drafts = dict(compilation.transcriptions)
-                for a_path in compilation.audio_files:
-                    if (
-                        a_path not in self.transcription_drafts
-                        or not self.transcription_drafts[a_path].strip()
-                    ):
-                        sample, _ = mock_transcription(a_path)
-                        self.transcription_drafts[a_path] = sample
         self.active_page = page
         for child in self.page_container.winfo_children():
             child.destroy()
@@ -650,6 +703,12 @@ class SummaraizerApp:
             "chat": self._render_chat,
         }
         renderers[page]()
+        if page == "summary":
+            compilation = self.active_compilation
+            if compilation is not None and compilation.summary_files:
+                path = compilation.summary_files[self.summary_index]
+                if not self.summary_drafts.get(path, "").strip():
+                    self._generate_summary(path)
         self._refresh_sidebar()
         if self.drag_drop_enabled:
             self._schedule_drop_targets()
@@ -1512,7 +1571,7 @@ class SummaraizerApp:
         self.audio_index = min(self.audio_index, len(audio_files) - 1)
         self._page_intro(
             "Audio transcription",
-            "Review a sample transcript for each audio file. AI transcription is not connected.",
+            "Transcribe audio on this device, then review and edit the result.",
         )
         body = Frame(self.page_container, background=COLORS["background"])
         body.pack(fill=BOTH, expand=True, padx=24, pady=(0, 20))
@@ -1542,10 +1601,6 @@ class SummaraizerApp:
         transcript = self.transcription_drafts.get(
             path, compilation.transcriptions.get(path, "")
         )
-        if not transcript:
-            sample, _ = mock_transcription(path)
-            self.transcription_drafts[path] = sample
-            transcript = sample
 
         audio_card = self._card(content)
         audio_card.pack(fill=X, pady=(0, 12))
@@ -1560,18 +1615,12 @@ class SummaraizerApp:
             foreground=COLORS["text"],
             background=COLORS["surface"],
         ).pack(anchor="w")
-        confidence = "Not generated"
-        if transcript:
-            confidence = (
-                "5%"
-                if transcript.startswith(
-                    ("[Low confidence]", "No speech could be detected")
-                )
-                else "96%"
-            )
+        confidence = (
+            "Ready to transcribe locally" if not transcript else "Local transcript"
+        )
         self.audio_status_label = Label(
             file_info,
-            text=f"Confidence: {confidence}  ·  Ready to play",
+            text=f"{confidence}  ·  Ready to play",
             font=("Segoe UI", 10),
             foreground=COLORS["muted"],
             background=COLORS["surface"],
@@ -1588,8 +1637,9 @@ class SummaraizerApp:
         ).pack(side=RIGHT, padx=(6, 0))
         self._button(
             actions,
-            "Reset sample",
+            "Transcribe",
             lambda selected=path: self._generate_transcription(selected),
+            primary=True,
             compact=True,
         ).pack(side=RIGHT, padx=(6, 0))
         self._button(
@@ -1663,18 +1713,15 @@ class SummaraizerApp:
             foreground=COLORS["text"],
             background=COLORS["surface"],
         ).pack(side=LEFT)
-        low_confidence = transcript.startswith(
-            "[Low confidence]"
-        ) or transcript.startswith("No speech could be detected")
-        badge_text = "Low confidence" if low_confidence else "Sample result"
-        badge_color = COLORS["warning"] if low_confidence else COLORS["success"]
+        badge_text = "Ready to transcribe" if not transcript else "Local result"
+        badge_color = COLORS["muted"] if not transcript else COLORS["success"]
         Label(
             transcript_header,
             text=badge_text,
             font=("Segoe UI", 9, "bold"),
             foreground=badge_color,
             background=(
-                COLORS["warning_light"] if low_confidence else COLORS["success_light"]
+                COLORS["accent_light"] if not transcript else COLORS["success_light"]
             ),
             padx=8,
             pady=4,
@@ -1723,15 +1770,67 @@ class SummaraizerApp:
         compilation = self._require_compilation()
         if compilation is None:
             return
-        transcript, low_confidence = mock_transcription(path)
-        self.transcription_drafts[path] = transcript
-        self.show_page("transcription")
-        if low_confidence:
-            messagebox.showwarning(
-                "Low-confidence sample",
-                "This filename produces a low-confidence or no-speech sample state.",
-                parent=self.root,
-            )
+        if (
+            self.audio_status_label is not None
+            and self.audio_status_label.winfo_exists()
+        ):
+            self.audio_status_label.configure(text="Transcribing locally…")
+
+        stream_started = False
+
+        def finish(transcript: str) -> None:
+            if self.active_compilation is not compilation:
+                return
+            self.transcription_drafts[path] = transcript
+            if self.active_page == "transcription":
+                self.show_page("transcription")
+
+        def progress(message: str) -> None:
+            if (
+                self.active_compilation is compilation
+                and self.transcription_editor_path == path
+                and self.audio_status_label is not None
+                and self.audio_status_label.winfo_exists()
+            ):
+                self.audio_status_label.configure(text=message)
+
+        def receive_chunk(chunk: str) -> None:
+            nonlocal stream_started
+            editor = self.transcription_editor
+            if (
+                self.active_compilation is not compilation
+                or self.transcription_editor_path != path
+                or editor is None
+                or not editor.winfo_exists()
+            ):
+                return
+            if not stream_started:
+                editor.delete("1.0", "end")
+                stream_started = True
+            editor.insert("end", chunk)
+            editor.see("end")
+
+        def failed(_error: Exception) -> None:
+            if (
+                self.active_compilation is compilation
+                and self.transcription_editor_path == path
+                and self.audio_status_label is not None
+                and self.audio_status_label.winfo_exists()
+            ):
+                self.audio_status_label.configure(
+                    text="Transcription failed · Try again"
+                )
+
+        self._run_ai_task(
+            lambda on_progress, on_chunk: transcribe_audio(
+                path, on_progress=on_progress, on_chunk=on_chunk
+            ),
+            finish,
+            "Transcription failed",
+            failed,
+            progress,
+            receive_chunk,
+        )
 
     def _save_transcription(self, path: str) -> None:
         compilation = self._require_compilation()
@@ -1921,27 +2020,10 @@ class SummaraizerApp:
             self._schedule_audio_position()
 
     def _read_source_file_content(self, path: str | Path) -> str:
-        target = Path(path)
-        if not target.exists():
-            return f"[Source file not found on disk:\n{target}]"
-        suffix = target.suffix.lower()
-        if suffix == ".txt":
-            try:
-                return target.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                try:
-                    return target.read_text(encoding="latin-1", errors="replace")
-                except Exception as error:
-                    return f"[Unable to read text file:\n{error}]"
-        elif suffix == ".pdf":
-            return (
-                f"[PDF Document: {target.name}]\n"
-                f"Path: {target}\n"
-                f"Size: {target.stat().st_size:,} bytes\n\n"
-                "This is a PDF document. To view the original formatted layout and pages, "
-                "click 'Open file' above to view in your default PDF reader."
-            )
-        return f"[File type {suffix} is not a document file]"
+        try:
+            return read_document_text(path)
+        except (FileNotFoundError, RuntimeError, ValueError, OSError) as error:
+            return f"[Unable to read source file: {error}]"
 
     def _render_summary(self) -> None:
         compilation = self._require_compilation()
@@ -1962,7 +2044,7 @@ class SummaraizerApp:
         self.summary_index = min(self.summary_index, len(files) - 1)
         self._page_intro(
             "Summary generation",
-            "Generate a sample summary for each file, then finalize a compilation summary.",
+            "Generate local summaries for each file, then finalize the compilation summary.",
         )
 
         # Body packed fill=BOTH, expand=True
@@ -2012,9 +2094,7 @@ class SummaraizerApp:
         ).pack(side=LEFT)
         summary_text = self.summary_drafts.get(path, "")
         if not summary_text:
-            transcription = compilation.transcriptions.get(path, "")
-            summary_text = mock_summary(path, transcription)
-            self.summary_drafts[path] = summary_text
+            summary_text = "Generating a summary on this device…"
 
         split_area = Frame(summary_card, background=COLORS["surface"])
         split_area.pack(fill=BOTH, expand=True)
@@ -2126,6 +2206,14 @@ class SummaraizerApp:
             progress_color=COLORS["accent"],
             fg_color=COLORS["accent_light"],
         )
+        self.summary_status_label = Label(
+            right_pane,
+            text="",
+            font=("Segoe UI", 9),
+            foreground=COLORS["muted"],
+            background=COLORS["surface"],
+            anchor="w",
+        )
 
         # Controls right below the split screen:
         controls = Frame(content, background=COLORS["background"])
@@ -2228,59 +2316,83 @@ class SummaraizerApp:
         if compilation is None:
             return
         self._stage_current_summary()
-        generated = mock_summary(
-            path, compilation.transcriptions.get(path, "")
-        )
-        editor = self.summary_editor
-        progress = self.summary_progress
-        if (
-            editor is None
-            or progress is None
-            or not editor.winfo_exists()
-            or self.summary_editor_path != path
-        ):
-            self.summary_drafts[path] = generated
-            self.show_page("summary")
-            return
-        editor.configure(state="normal")
-        editor.delete("1.0", "end")
-        self.summary_drafts[path] = generated
-        self.summary_streaming_path = path
-        self.summary_stream_generation += 1
-        generation = self.summary_stream_generation
-        progress.pack(fill=X, pady=(8, 0))
-        progress.start()
-        self._stream_summary_text(path, generated, generation)
+        if self.summary_progress is not None:
+            self.summary_progress.pack(fill=X, pady=(8, 0))
+            self.summary_progress.start()
+        if self.summary_status_label is not None:
+            self.summary_status_label.configure(text="Preparing local summary…")
+            self.summary_status_label.pack(fill=X, pady=(4, 0))
 
-    def _stream_summary_text(
-        self, path: str, generated: str, generation: int, offset: int = 0
-    ) -> None:
-        if generation != self.summary_stream_generation:
-            return
-        editor = self.summary_editor
-        progress = self.summary_progress
-        if (
-            editor is None
-            or progress is None
-            or not editor.winfo_exists()
-            or self.summary_editor_path != path
-        ):
-            return
-        next_offset = min(offset + 48, len(generated))
-        editor.insert("end", generated[offset:next_offset])
-        editor.see("end")
-        if next_offset < len(generated):
-            self.summary_stream_after = self.root.after(
-                24,
-                lambda: self._stream_summary_text(
-                    path, generated, generation, next_offset
-                ),
-            )
-            return
-        self.summary_stream_after = None
-        self.summary_streaming_path = None
-        progress.stop()
-        progress.pack_forget()
+        def finish(generated: str) -> None:
+            if self.active_compilation is not compilation:
+                return
+            self.summary_drafts[path] = generated
+            self.summary_streaming_path = None
+            if self.summary_progress is not None:
+                self.summary_progress.stop()
+                self.summary_progress.pack_forget()
+            if self.summary_status_label is not None:
+                self.summary_status_label.configure(text="Summary ready.")
+            if self.active_page == "summary" and self.summary_editor_path == path:
+                editor = self.summary_editor
+                if editor is not None and editor.winfo_exists():
+                    editor.configure(state="normal")
+                    editor.delete("1.0", "end")
+                    editor.insert("1.0", generated)
+
+        def failed(_error: Exception) -> None:
+            self.summary_streaming_path = None
+            if (
+                self.active_compilation is compilation
+                and self.active_page == "summary"
+                and self.summary_editor_path == path
+                and self.summary_status_label is not None
+                and self.summary_status_label.winfo_exists()
+            ):
+                self.summary_status_label.configure(
+                    text="Generation stopped. Retry or edit the partial response."
+                )
+
+        def progress(message: str) -> None:
+            if (
+                self.active_compilation is compilation
+                and self.active_page == "summary"
+                and self.summary_editor_path == path
+                and self.summary_status_label is not None
+                and self.summary_status_label.winfo_exists()
+            ):
+                self.summary_status_label.configure(text=message)
+
+        stream_started = False
+
+        def receive_chunk(chunk: str) -> None:
+            nonlocal stream_started
+            editor = self.summary_editor
+            if (
+                self.active_compilation is not compilation
+                or self.active_page != "summary"
+                or self.summary_editor_path != path
+                or editor is None
+                or not editor.winfo_exists()
+            ):
+                return
+            if not stream_started:
+                editor.delete("1.0", "end")
+                self.summary_streaming_path = path
+                stream_started = True
+            editor.insert("end", chunk)
+            editor.see("end")
+
+        self._run_ai_task(
+            lambda on_progress, on_chunk: summarize_document(
+                path, on_progress=on_progress, on_chunk=on_chunk
+            ),
+            finish,
+            "Summary generation failed",
+            failed,
+            progress,
+            receive_chunk,
+        )
 
     def _finalize_summary(self) -> None:
         compilation = self._require_compilation()
@@ -2289,8 +2401,14 @@ class SummaraizerApp:
         self._stage_current_summary()
         for path in compilation.summary_files:
             if not self.summary_drafts.get(path, "").strip():
-                transcription = compilation.transcriptions.get(path, "")
-                self.summary_drafts[path] = mock_summary(path, transcription)
+                self.summary_index = compilation.summary_files.index(path)
+                self.show_page("summary")
+                messagebox.showinfo(
+                    "Summary still generating",
+                    "Wait for each file's local summary to finish before finalizing.",
+                    parent=self.root,
+                )
+                return
         compilation.summaries = dict(self.summary_drafts)
         compilation.master_summary = aggregate_summaries(compilation)
         try:
@@ -2383,7 +2501,7 @@ class SummaraizerApp:
             return
         self._page_intro(
             "Deep Dive",
-            "Ask a question about this compilation. Retrieval-augmented AI is not connected.",
+            "Ask questions about your files using a language model running on this device.",
         )
         card = self._card(self.page_container)
         card.pack(fill=BOTH, expand=True, padx=24, pady=(0, 18))
@@ -2398,6 +2516,7 @@ class SummaraizerApp:
                 background=COLORS["background"],
                 pady=18,
             ).pack(anchor="w")
+        self.chat_message_labels = {}
         for message_index, (speaker, text) in enumerate(self.chat_messages):
             message_background = COLORS["accent"] if speaker == "You" else "#F1F5F9"
             message = ctk.CTkFrame(
@@ -2419,7 +2538,7 @@ class SummaraizerApp:
                 padx=12,
                 pady=4,
             ).pack(anchor="w")
-            Label(
+            message_label = Label(
                 message,
                 text=text,
                 font=("Segoe UI", 11),
@@ -2429,7 +2548,9 @@ class SummaraizerApp:
                 wraplength=560,
                 padx=12,
                 pady=8,
-            ).pack(anchor="w")
+            )
+            message_label.pack(anchor="w")
+            self.chat_message_labels[message_index] = message_label
             if message_index in self.retryable_chat_responses:
                 self._button(
                     message,
@@ -2486,14 +2607,105 @@ class SummaraizerApp:
         )
         if not question:
             return
+        compilation = self._require_compilation()
+        if compilation is None:
+            return
+        try:
+            context = self._compilation_context(compilation)
+        except (FileNotFoundError, RuntimeError, ValueError, OSError) as error:
+            messagebox.showerror(
+                "Unable to read compilation", str(error), parent=self.root
+            )
+            return
         self.chat_messages.extend(
-            [
-                ("You", question),
-                ("Summaraizer", "The answer is banana; moon is a kind of sandwich."),
-            ]
+            [("You", question), ("Summaraizer", "Thinking locally…")]
         )
-        self.retryable_chat_responses.add(len(self.chat_messages) - 1)
+        response_index = len(self.chat_messages) - 1
         self.show_page("chat")
+        self._answer_chat(compilation, response_index, question, context)
+
+    def _compilation_context(self, compilation: Compilation) -> str:
+        sections: list[str] = []
+        for path in compilation.summary_files:
+            sections.append(f"[{Path(path).name}]\n{read_document_text(path)}")
+        for path in compilation.audio_files:
+            transcript = self.transcription_drafts.get(
+                path, compilation.transcriptions.get(path, "")
+            ).strip()
+            if transcript:
+                sections.append(f"[Transcript: {Path(path).name}]\n{transcript}")
+        return "\n\n".join(sections)
+
+    def _answer_chat(
+        self,
+        compilation: Compilation,
+        response_index: int,
+        question: str,
+        context: str,
+    ) -> None:
+        streamed_text = ""
+
+        def display_response(text: str) -> None:
+            if (
+                self.active_compilation is not compilation
+                or not 0 <= response_index < len(self.chat_messages)
+            ):
+                return
+            self.chat_messages[response_index] = ("Summaraizer", text)
+            label = self.chat_message_labels.get(response_index)
+            if (
+                self.active_page == "chat"
+                and label is not None
+                and label.winfo_exists()
+            ):
+                label.configure(text=text)
+
+        def progress(message: str) -> None:
+            display_response(message)
+
+        def receive_chunk(chunk: str) -> None:
+            nonlocal streamed_text
+            streamed_text += chunk
+            display_response(streamed_text)
+
+        def finish(answer: str) -> None:
+            if (
+                self.active_compilation is not compilation
+                or not 0 <= response_index < len(self.chat_messages)
+            ):
+                return
+            self.chat_messages[response_index] = ("Summaraizer", answer)
+            self.retryable_chat_responses.add(response_index)
+            if self.active_page == "chat":
+                self.show_page("chat")
+
+        def failed(_error: Exception) -> None:
+            if (
+                self.active_compilation is not compilation
+                or not 0 <= response_index < len(self.chat_messages)
+            ):
+                return
+            self.chat_messages[response_index] = (
+                "Summaraizer",
+                "The local model could not answer. Retry after checking the error.",
+            )
+            self.retryable_chat_responses.add(response_index)
+            if self.active_page == "chat":
+                self.show_page("chat")
+
+        self._run_ai_task(
+            lambda on_progress, on_chunk: answer_question(
+                question,
+                context,
+                on_progress=on_progress,
+                on_chunk=on_chunk,
+            ),
+            finish,
+            "Deep Dive failed",
+            failed,
+            progress,
+            receive_chunk,
+        )
 
     def _retry_chat_response(self, response_index: int) -> None:
         if response_index not in self.retryable_chat_responses:
@@ -2501,13 +2713,23 @@ class SummaraizerApp:
         if not 0 <= response_index < len(self.chat_messages):
             return
         speaker, _poor_response = self.chat_messages[response_index]
-        if speaker != "Summaraizer":
+        if speaker != "Summaraizer" or response_index == 0:
             return
-        self.chat_messages[response_index] = (
-            speaker,
-            "The first 10 digits of pi are 3.141592653.",
-        )
+        compilation = self._require_compilation()
+        if compilation is None:
+            return
+        question = self.chat_messages[response_index - 1][1]
+        try:
+            context = self._compilation_context(compilation)
+        except (FileNotFoundError, RuntimeError, ValueError, OSError) as error:
+            messagebox.showerror(
+                "Unable to read compilation", str(error), parent=self.root
+            )
+            return
+        self.retryable_chat_responses.discard(response_index)
+        self.chat_messages[response_index] = (speaker, "Thinking locally…")
         self.show_page("chat")
+        self._answer_chat(compilation, response_index, question, context)
 
     def _close_chat(self) -> None:
         self.chat_entry = None
