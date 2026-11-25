@@ -67,6 +67,8 @@ time.
 The primary button advances with "Next File"; when reaching the final file in the
 compilation, the "Save" button is removed and the primary button turns into
 "Finalize" to aggregate and complete the compilation summary. Transcripts and
-summaries are editable before being saved. Deep Dive sends local file text and
-saved transcripts as context to the on-device language model and streams the
-response into the conversation.
+summaries are editable before being saved. Deep Dive splits local file text and
+saved transcripts into passages, ranks them against each question with a local
+BM25 retriever, and sends the most relevant passages to the on-device language
+model. Responses stream into the conversation and remain grounded in the
+retrieved source material.

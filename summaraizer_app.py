@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -592,6 +593,14 @@ class SummaraizerApp:
         self.store.save(self.compilations)
 
     def _set_active(self, compilation: Compilation) -> None:
+        if self.active_compilation is not compilation:
+            self.audio_index = 0
+            self.summary_index = 0
+            self.summary_drafts.clear()
+            self.transcription_drafts.clear()
+            self.chat_messages.clear()
+            self.chat_message_labels.clear()
+            self.retryable_chat_responses.clear()
         self.active_compilation = compilation
 
     def _require_compilation(self) -> Compilation | None:
@@ -2625,16 +2634,66 @@ class SummaraizerApp:
         self._answer_chat(compilation, response_index, question, context)
 
     def _compilation_context(self, compilation: Compilation) -> str:
-        sections: list[str] = []
-        for path in compilation.summary_files:
-            sections.append(f"[{Path(path).name}]\n{read_document_text(path)}")
+        summary_files = compilation.summary_files
+        summary_file_set = {str(Path(path).resolve()) for path in summary_files}
+        audio_entries: list[tuple[str, str]] = []
         for path in compilation.audio_files:
+            if str(transcript_path_for(path).resolve()) in summary_file_set:
+                continue
             transcript = self.transcription_drafts.get(
                 path, compilation.transcriptions.get(path, "")
             ).strip()
             if transcript:
-                sections.append(f"[Transcript: {Path(path).name}]\n{transcript}")
+                audio_entries.append((path, transcript))
+
+        name_counts: dict[str, int] = {}
+        for path in [*summary_files, *(path for path, _ in audio_entries)]:
+            name = Path(path).name
+            name_counts[name] = name_counts.get(name, 0) + 1
+
+        def format_label(path: str) -> str:
+            target = Path(path)
+            if name_counts.get(target.name, 0) > 1 and target.parent.name:
+                return f"{target.parent.name}/{target.name}"
+            return target.name
+
+        sections: list[str] = [
+            f"[{format_label(path)}]\n{read_document_text(path)}"
+            for path in summary_files
+        ]
+        sections.extend(
+            f"[Transcript: {format_label(path)}]\n{transcript}"
+            for path, transcript in audio_entries
+        )
         return "\n\n".join(sections)
+
+    def _chat_history_before(self, response_index: int) -> list[tuple[str, str]]:
+        ignored_replies = {
+            "Thinking locally…",
+            "Preparing the response…",
+            "Preparing the local AI runtime…",
+            "Generating response…",
+            "The local model could not answer. Retry after checking the error.",
+            "I couldn't find relevant passages in this compilation to answer that question.",
+        }
+        history: list[tuple[str, str]] = []
+        prior = self.chat_messages[: max(0, response_index - 1)]
+        idx = 0
+        while idx + 1 < len(prior):
+            user_speaker, user_text = prior[idx]
+            bot_speaker, bot_text = prior[idx + 1]
+            if (
+                user_speaker == "You"
+                and bot_speaker == "Summaraizer"
+                and user_text.strip()
+                and bot_text.strip()
+                and bot_text not in ignored_replies
+            ):
+                history.extend([(user_speaker, user_text), (bot_speaker, bot_text)])
+                idx += 2
+            else:
+                idx += 1
+        return history
 
     def _answer_chat(
         self,
@@ -2644,6 +2703,7 @@ class SummaraizerApp:
         context: str,
     ) -> None:
         streamed_text = ""
+        history = self._chat_history_before(response_index)
 
         def display_response(text: str) -> None:
             if (
@@ -2693,13 +2753,29 @@ class SummaraizerApp:
             if self.active_page == "chat":
                 self.show_page("chat")
 
-        self._run_ai_task(
-            lambda on_progress, on_chunk: answer_question(
+        def run_answer(on_progress: Callable[[str], None], on_chunk: Callable[[str], None]) -> str:
+            supports_history = any(
+                param.name == "history"
+                or param.kind == inspect.Parameter.VAR_KEYWORD
+                for param in inspect.signature(answer_question).parameters.values()
+            )
+            if supports_history and history:
+                return answer_question(
+                    question,
+                    context,
+                    on_progress=on_progress,
+                    on_chunk=on_chunk,
+                    history=history,
+                )
+            return answer_question(
                 question,
                 context,
                 on_progress=on_progress,
                 on_chunk=on_chunk,
-            ),
+            )
+
+        self._run_ai_task(
+            run_answer,
             finish,
             "Deep Dive failed",
             failed,
